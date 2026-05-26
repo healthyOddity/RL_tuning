@@ -1,5 +1,12 @@
 # sim/ — 可微控制仿真
 
+## 运行环境
+
+所有命令在 `conda activate pypose` 虚拟环境中运行。测试、训练、demo 均需先激活该环境：
+```bash
+conda activate pypose
+```
+
 ## 概述
 
 将 C++ 控制器用 PyTorch 复现（`nn.Module`），搭配三种可选被控对象，通过 BPTT 进行梯度调参。
