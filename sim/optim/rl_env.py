@@ -120,7 +120,7 @@ class RLTuningEnv(gym.Env):
     ], dtype=np.float32)
 
     def __init__(self, plant='hybrid_v2', config_path=None, seed=None,
-                 trajectory_types=None):
+                 trajectory_types=None, compute_baseline_losses=True):
         super().__init__()
 
         self.seed_val = seed
@@ -143,6 +143,8 @@ class RLTuningEnv(gym.Env):
 
         self._setup_trajectories(trajectory_types)
         self._precompute_features()
+        if compute_baseline_losses:
+            self._precompute_baseline_losses()
 
         self.episode_count = 0
         self._current_features = np.zeros(10, dtype=np.float32)
@@ -272,6 +274,29 @@ class RLTuningEnv(gym.Env):
         self.lon_ctrl.high_speed_ki.data = torch.tensor(self._baseline_high_speed_ki)
         self.lon_ctrl.switch_speed.data = torch.tensor(self._baseline_switch_speed)
 
+    def _precompute_baseline_losses(self):
+        from optim.train import tracking_loss
+        self._baseline_losses = {}
+        for i, key in enumerate(self._traj_keys_list):
+            print(f"  [RLTuningEnv] 预计算 baseline loss: [{i+1}/{len(self._traj_keys_list)}] {key} ...", end=" ", flush=True)
+            traj = self._traj_cache[key]
+            traj_speed = traj[0].v
+            history = run_simulation(
+                traj, init_speed=traj_speed,
+                init_x=traj[0].x, init_y=traj[0].y, init_yaw=traj[0].theta,
+                cfg=self.cfg, lat_ctrl=self.lat_ctrl, lon_ctrl=self.lon_ctrl,
+                differentiable=False)
+            tensor_history = [{k: torch.tensor(v, dtype=torch.float32) for k, v in h.items()} for h in history]
+            loss = tracking_loss(tensor_history, ref_speed=traj_speed,
+                                 w_lat=10.0, w_head=8.0, w_speed=3.0,
+                                 w_steer_rate=0.05, w_acc_rate=0.01).item()
+            self._baseline_losses[key] = max(loss, 1e-6)
+            print(f"{loss:.4f}")
+        sorted_baselines = sorted(self._baseline_losses.values())
+        median_baseline = sorted_baselines[len(sorted_baselines) // 2]
+        self._norm_floor = median_baseline ** 0.5
+        print(f"  [RLTuningEnv] baseline loss 预计算完成, norm_floor={self._norm_floor:.4f}")
+
     def _build_obs(self) -> np.ndarray:
         params = np.array([
             1.0, 1.0, 1.0, 1.0,
@@ -291,12 +316,31 @@ class RLTuningEnv(gym.Env):
             {k: torch.tensor(v, dtype=torch.float32) for k, v in h.items()}
             for h in history
         ]
-        loss = tracking_loss(
+        raw_loss = tracking_loss(
             tensor_history, ref_speed=ref_speed,
             w_lat=10.0, w_head=8.0, w_speed=3.0,
             w_steer_rate=0.05, w_acc_rate=0.01,
-            return_details=False)
-        return -float(loss.item())
+            return_details=False).item()
+
+        baseline = self._baseline_losses.get(self._current_key, 1.0)
+        norm_factor = max(baseline ** 0.5, self._norm_floor)
+        normalized_loss = raw_loss / norm_factor
+
+        l2 = 0.0
+        l2 += ((self.lat_ctrl.T2_y.data - self._baseline_T2_y) ** 2).sum().item()
+        l2 += ((self.lat_ctrl.T3_y.data - self._baseline_T3_y) ** 2).sum().item()
+        l2 += ((self.lat_ctrl.T4_y.data - self._baseline_T4_y) ** 2).sum().item()
+        l2 += ((self.lat_ctrl.T6_y.data - self._baseline_T6_y) ** 2).sum().item()
+        l2 += (self.lon_ctrl.station_kp.item() - self._baseline_station_kp) ** 2
+        l2 += (self.lon_ctrl.station_ki.item() - self._baseline_station_ki) ** 2
+        l2 += (self.lon_ctrl.low_speed_kp.item() - self._baseline_low_speed_kp) ** 2
+        l2 += (self.lon_ctrl.low_speed_ki.item() - self._baseline_low_speed_ki) ** 2
+        l2 += (self.lon_ctrl.high_speed_kp.item() - self._baseline_high_speed_kp) ** 2
+        l2 += (self.lon_ctrl.high_speed_ki.item() - self._baseline_high_speed_ki) ** 2
+        l2 += (self.lon_ctrl.switch_speed.item() - self._baseline_switch_speed) ** 2
+
+        reward = -(normalized_loss + 0.01 * l2)
+        return reward
 
     def get_ood_stats(self) -> dict:
         return {

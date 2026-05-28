@@ -36,7 +36,8 @@ plt.rcParams['axes.unicode_minus'] = False
 
 def evaluate_rl_model(model_path, plant, dc_config_path, output_dir=None):
     model = SAC.load(model_path)
-    env = RLTuningEnv(plant=plant, config_path=dc_config_path)
+    env = RLTuningEnv(plant=plant, config_path=dc_config_path,
+                       compute_baseline_losses=False)
 
     dc_cfg = load_config(dc_config_path)
     if plant:

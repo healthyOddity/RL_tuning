@@ -160,3 +160,25 @@ class TestRLTuningEnv:
             env._baseline_T2_y.numpy())
         assert env.lon_ctrl.station_kp.item() == pytest.approx(
             env._baseline_station_kp)
+
+    def test_baseline_losses_populated(self, env):
+        assert len(env._baseline_losses) == len(env._traj_keys_list)
+        for key in env._traj_keys_list:
+            assert key in env._baseline_losses
+            assert env._baseline_losses[key] > 0
+
+    def test_norm_floor_computed(self, env):
+        assert hasattr(env, '_norm_floor')
+        assert env._norm_floor > 0
+        assert np.isfinite(env._norm_floor)
+
+    def test_reward_l2_penalty_exists(self, env):
+        env.reset()
+        action = np.array([0.2] * 11, dtype=np.float32)
+        env._apply_action(action)
+        l2_manual = 0.0
+        l2_manual += ((env.lat_ctrl.T2_y.data - env._baseline_T2_y) ** 2).sum().item()
+        l2_manual += ((env.lat_ctrl.T3_y.data - env._baseline_T3_y) ** 2).sum().item()
+        l2_manual += ((env.lat_ctrl.T4_y.data - env._baseline_T4_y) ** 2).sum().item()
+        l2_manual += ((env.lat_ctrl.T6_y.data - env._baseline_T6_y) ** 2).sum().item()
+        assert l2_manual > 0
