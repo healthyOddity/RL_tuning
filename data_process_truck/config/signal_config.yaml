@@ -1,0 +1,48 @@
+# 时间与状态信号
+timestamp: timestamp # 采样时间戳，单位通常为秒
+vehicle_speed: debug.simple_lon_debug.current_speed # 原始车速信号，可用于通用速度展示或兼容不同日志字段
+
+# 自车实际状态
+x: position_enu.x # 自车实际 X 坐标
+y: position_enu.y # 自车实际 Y 坐标
+yaw: euler_angles.z # 自车实际航向角
+yaw_rate: VehicleInfoBDData.BD18F0090B_VDC2_YawRate # 自车横摆角速度
+
+# 横向控制相关信号
+lateral_error: debug.simple_lat_debug.lateral_error # 横向跟踪误差 e_y
+heading_error: debug.simple_lat_debug.heading_error # 航向跟踪误差 e_psi
+steer_fb: debug.simple_lat_debug.steer_angle_feedback # 转向反馈项输出
+steer_ff: debug.simple_lat_debug.steer_angle_feedforward # 转向前馈项输出
+steer_out: VehicleInfoADData.AD18FFE213_EHPS_SteerWheelAng # 最终转向输出
+curvature_far: curvature_far # 远端预瞄曲率或前方道路曲率信号
+
+# 控制状态与纵向信号
+controller_enable: controller_enable # 控制器使能标志，常用于裁剪有效控制段
+station_error: debug.simple_lon_debug.station_error # 站位误差，表示沿参考轨迹的距离误差
+preview_speed_error: debug.simple_lon_debug.preview_speed_error # 预瞄速度误差，缺失时可退化为 ego_v - ref_v
+speed_offset: debug.simple_lon_debug.speed_offset # 速度偏置或附加速度修正量
+acc_closeloop: debug.simple_lon_debug.acceleration_cmd_closed_loop # 纵向闭环加速度项
+acc_cmd: debug.simple_lon_debug.acceleration_cmd # 纵向加速度指令
+acc_out: debug.simple_lon_debug.acceleration_cmd # 最终纵向加速度输出
+ego_s: ego_s # 自车沿参考线或路径的累计弧长
+ego_v: debug.simple_lon_debug.current_speed # 自车实际速度
+ego_a: debug.simple_lon_debug.current_acceleration # 自车实际加速度
+
+# 参考轨迹信号
+ref_x: ref_x # 参考轨迹 X 坐标
+ref_y: ref_y # 参考轨迹 Y 坐标
+ref_yaw: ref_yaw # 参考轨迹航向角
+ref_kappa: ref_kappa # 参考轨迹曲率
+ref_s: ref_s # 参考轨迹累计弧长
+ref_v: ref_v # 参考速度
+ref_a: ref_a # 参考加速度
+
+# 事件与场景标记
+event_control_enable: event_control_enable # 控制状态事件标志，可用于状态分析
+event_takeover: event_takeover # 接管事件标志，常用于剔除人工接管区段
+event_lane_change: event_lane_change # 变道场景事件标志
+event_curve_enter: event_curve_enter # 入弯事件标志
+event_curve_exit: event_curve_exit # 出弯事件标志
+event_follow_start: event_follow_start # 跟车场景开始事件标志
+event_stop_start: event_stop_start # 停车过程开始事件标志
+event_stop_end: event_stop_end # 停车过程结束事件标志

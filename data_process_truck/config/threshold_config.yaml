@@ -1,0 +1,20 @@
+lateral:
+  ey_rms_soft: 0.12
+  overshoot_high: 0.25
+  yaw_osc_high: 0.35
+  phase_lag_high: 0.40
+
+longitudinal:
+  response_delay_high: 0.45
+  jerk_rms_high: 1.80
+  stop_over_threshold: 0.35
+  stop_soft_threshold: -0.25
+  speed_bias_threshold: 0.30
+
+scenario:
+  min_duration: 3.0
+  curve_kappa_threshold: 0.003
+  curve_kappa_point_threshold: 0.005
+  curve_sustained_ratio: 0.3
+  lane_change_lat_offset_threshold: 0.6
+  stop_speed_threshold: 0.3

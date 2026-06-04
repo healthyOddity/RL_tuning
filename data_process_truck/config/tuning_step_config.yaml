@@ -1,0 +1,9 @@
+k_lat_resp: 0.05
+k_lat_damp: 0.10
+k_lat_ff: 0.03
+k_lon_station: 0.05
+k_lon_speed: 0.05
+r_station_i: 0.05
+r_speed_i: 0.05
+r_speed_i_small: 0.02
+v_switch_bias: 0.5

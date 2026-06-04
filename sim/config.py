@@ -36,6 +36,11 @@ def load_config(path: str | None = None) -> dict:
 
 def apply_plant_override(cfg: dict, plant: str) -> None:
     """将 --plant 参数应用到配置。hybrid_v2 需要额外默认值。"""
+    cfg['vehicle']['requested_model_type'] = plant
+    if plant == 'truck_trailer_dynamics':
+        cfg['vehicle']['model_type'] = 'truck_trailer'
+        cfg['truck_trailer_vehicle']['checkpoint_path'] = ''
+        return
     cfg['vehicle']['model_type'] = plant
     if plant == 'hybrid_v2':
         cfg['vehicle'].setdefault('base_model', 'dynamic_v2')

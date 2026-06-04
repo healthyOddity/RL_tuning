@@ -1,0 +1,202 @@
+# Example mapping for RoboTruck_UDP_397toORIN_20260120.dbc.
+# This is enough to smoke-test BLF decoding on the current sample file.
+# It is not a confirmed training-target mapping because steering_target,
+# target_torque and ADS_State are not present in the observed BLF/DBC pair.
+
+base_time_signal: VehicleInfoBDData.BDCFF10D0_VCU_VehicleSpeed
+fallback_time_signal: euler_angles.z
+
+interpolation:
+  default: linear
+  nearest_columns:
+    - controller_enable
+    - AlgSysState.TopStateData_Struct.ADS_State
+    - VehicleInfoADData.AD18F101D0_TCU_CurrentGear
+
+torque_distribution:
+  mode: split_rear
+
+target_columns:
+  - target_column: _raw.ins_latitude
+    required_level: optional_debug
+    source_kind: dbc_signal
+    message_name: INSMessageData
+    signal_name: INSCFF129A_INS1_Latitude
+    output: false
+
+  - target_column: _raw.ins_longitude
+    required_level: optional_debug
+    source_kind: dbc_signal
+    message_name: INSMessageData
+    signal_name: INSCFF129A_INS1_Longitude
+    output: false
+
+  - target_column: position_enu.x
+    required_level: blocking
+    source_kind: derived
+    derive_rule: enu_x:_raw.ins_latitude:_raw.ins_longitude
+
+  - target_column: position_enu.y
+    required_level: blocking
+    source_kind: derived
+    derive_rule: enu_y:_raw.ins_latitude:_raw.ins_longitude
+
+  - target_column: euler_angles.z
+    required_level: blocking
+    source_kind: dbc_signal
+    message_name: INSMessageData
+    signal_name: INSCFF129A_INS1_HeadingAngle
+
+  - target_column: heading
+    required_level: optional_debug
+    source_kind: derived
+    derive_rule: copy:euler_angles.z
+
+  - target_column: VehicleInfoBDData.BDCFF10D0_VCU_VehicleSpeed
+    required_level: blocking
+    source_kind: dbc_signal
+    message_name: FASDataTransmission1
+    signal_name: FAS18FF05E8_F_CIN_Vehicle_Speed
+
+  - target_column: VehicleInfoBDData.BD18F0090B_VDC2_YawRate
+    required_level: blocking
+    source_kind: dbc_signal
+    message_name: FASDataTransmission1
+    signal_name: FAS18FF05E8_F_CIN_Vehicle_Yaw
+    unit_transform: {scale: 0.017453292519943295, offset: 0.0}
+
+  - target_column: VehicleInfoADData.AD18F0090B_VDC2_SteeringWheelAngle
+    required_level: optional_debug
+    source_kind: dbc_signal
+    message_name: FASDataTransmission1
+    signal_name: FAS18FF05E8_F_CIN_Steering_Wheel_Angle
+
+  - target_column: VehicleInfoADData.AD18FFE313_Steering_Angle
+    required_level: optional_debug
+    source_kind: derived
+    derive_rule: copy:VehicleInfoADData.AD18F0090B_VDC2_SteeringWheelAngle
+
+  - target_column: VehicleInfoADData.AD18F101D0_TCU_CurrentGear
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
+
+  - target_column: VehicleInfoADData.AD18FFE213_EHPS_SteerWheelAng
+    required_level: optional_debug
+    source_kind: derived
+    derive_rule: copy:VehicleInfoADData.AD18F0090B_VDC2_SteeringWheelAngle
+
+  - target_column: steering_target
+    required_level: blocking
+    source_kind: derived
+    derive_rule: copy:VehicleInfoADData.AD18F0090B_VDC2_SteeringWheelAngle
+
+  - target_column: target_torque
+    required_level: blocking
+    source_kind: constant
+    fill_value: 0.0
+
+  - target_column: debug.simple_lon_debug.path_remain
+    required_level: blocking
+    source_kind: derived
+    derive_rule: copy:target_torque
+
+  - target_column: AlgSysState.TopStateData_Struct.ADS_State
+    required_level: required_for_scene_split
+    source_kind: constant
+    fill_value: 4.0
+
+  - target_column: controller_enable
+    required_level: required_for_scene_split
+    source_kind: derived
+    derive_rule: equals:AlgSysState.TopStateData_Struct.ADS_State:4
+
+  - target_column: debug.simple_lon_debug.station_error
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
+  - target_column: debug.simple_lon_debug.preview_speed_error
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
+  - target_column: debug.simple_lon_debug.current_speed
+    required_level: required_for_scene_split
+    source_kind: derived
+    derive_rule: scale:VehicleInfoBDData.BDCFF10D0_VCU_VehicleSpeed:0.2777777777777778:0.0
+  - target_column: debug.simple_lon_debug.speed_error
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
+  - target_column: debug.simple_lon_debug.acceleration_cmd
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
+  - target_column: debug.simple_lon_debug.current_acceleration
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
+  - target_column: debug.simple_lon_debug.speed_offset
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
+  - target_column: debug.simple_lon_debug.acceleration_cmd_closeloop
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
+  - target_column: debug.simple_lat_debug.lateral_error
+    required_level: required_for_scene_split
+    source_kind: constant
+    fill_value: 0.0
+  - target_column: debug.simple_lat_debug.heading_error
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
+  - target_column: debug.simple_lat_debug.steer_angle
+    required_level: optional_debug
+    source_kind: derived
+    derive_rule: copy:VehicleInfoADData.AD18F0090B_VDC2_SteeringWheelAngle
+  - target_column: debug.simple_lat_debug.steer_angle_feedforward
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
+  - target_column: debug.simple_lat_debug.steer_angle_feedback
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
+  - target_column: debug.simple_lat_debug.heading_rate
+    required_level: optional_debug
+    source_kind: derived
+    derive_rule: copy:VehicleInfoBDData.BD18F0090B_VDC2_YawRate
+
+  - target_column: ref_kappa
+    required_level: required_for_scene_split
+    source_kind: constant
+    fill_value: 0.0
+  - target_column: ref_dkappa
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
+  - target_column: ref_s
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
+  - target_column: ref_theta
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
+  - target_column: ref_x
+    required_level: required_for_scene_split
+    source_kind: derived
+    derive_rule: copy:position_enu.x
+  - target_column: ref_y
+    required_level: required_for_scene_split
+    source_kind: derived
+    derive_rule: copy:position_enu.y
+  - target_column: ref_v
+    required_level: optional_debug
+    source_kind: derived
+    derive_rule: scale:VehicleInfoBDData.BDCFF10D0_VCU_VehicleSpeed:0.2777777777777778:0.0
+  - target_column: ref_a
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0

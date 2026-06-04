@@ -1,0 +1,12 @@
+# 示例：同一个 BLF 里有多个 channel 时，可用该文件限定每个 channel 使用哪些 DBC。
+# 路径可以写绝对路径，也可以写相对本 YAML 所在目录的路径。
+#
+# channels:
+#   "0":
+#     - C:/path/to/channel0.dbc
+#   "1":
+#     - C:/path/to/channel1.dbc
+#   "2":
+#     - C:/path/to/channel2.dbc
+
+channels: {}

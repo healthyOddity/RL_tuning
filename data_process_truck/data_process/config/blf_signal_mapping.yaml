@@ -1,0 +1,224 @@
+# BLF/DBC 到现有 *_interpolated.csv 的字段映射配置
+#
+# 使用方式：
+# 1. 先运行 audit_can_signals.py --dbc xxx.dbc，查看 DBC 中真实 message/signal 名称。
+# 2. 将下面每个 dbc_signal 项的 message_name、signal_name 改成 DBC 中的真实名称。
+# 3. 普通底盘 CAN 通常只能覆盖车速、横摆角速度、方向盘角、档位等信号；
+#    定位、ADU 控制目标、规划参考线和 control_debug 信号需要确认 BLF 中是否存在对应 CAN 报文。
+
+base_time_signal: steering_target
+fallback_time_signal: VehicleInfoBDData.BDCFF10D0_VCU_VehicleSpeed
+
+interpolation:
+  default: linear
+  nearest_columns:
+    - controller_enable
+    - AlgSysState.TopStateData_Struct.ADS_State
+    - VehicleInfoADData.AD18F101D0_TCU_CurrentGear
+
+torque_distribution:
+  # split_rear: torque_wheel 平均分配到后轮，前轮置 0
+  mode: split_rear
+
+target_columns:
+  - target_column: position_enu.x
+    required_level: blocking
+    source_kind: dbc_signal
+    message_name:
+    signal_name:
+    unit_transform: {scale: 1.0, offset: 0.0}
+    notes: "定位/惯导 X 坐标；普通底盘 CAN 可能没有。"
+
+  - target_column: position_enu.y
+    required_level: blocking
+    source_kind: dbc_signal
+    message_name:
+    signal_name:
+    unit_transform: {scale: 1.0, offset: 0.0}
+    notes: "定位/惯导 Y 坐标；普通底盘 CAN 可能没有。"
+
+  - target_column: euler_angles.z
+    required_level: blocking
+    source_kind: dbc_signal
+    message_name:
+    signal_name:
+    unit_transform: {scale: 1.0, offset: 0.0}
+    notes: "车辆航向角 yaw，单位建议为 deg。"
+
+  - target_column: heading
+    required_level: optional_debug
+    source_kind: derived
+    derive_rule: copy:euler_angles.z
+
+  - target_column: VehicleInfoBDData.BDCFF10D0_VCU_VehicleSpeed
+    required_level: blocking
+    source_kind: dbc_signal
+    message_name:
+    signal_name:
+    unit_transform: {scale: 1.0, offset: 0.0}
+    notes: "车速，保持 km/h，csvdata_new_truck.py 会除以 3.6。"
+
+  - target_column: VehicleInfoBDData.BD18F0090B_VDC2_YawRate
+    required_level: blocking
+    source_kind: dbc_signal
+    message_name:
+    signal_name:
+    unit_transform: {scale: 1.0, offset: 0.0}
+    notes: "横摆角速度，现有 csvdata_new_truck.py 会按 rad/s 转 deg/s。"
+
+  - target_column: VehicleInfoADData.AD18F0090B_VDC2_SteeringWheelAngle
+    required_level: optional_debug
+    source_kind: dbc_signal
+    message_name:
+    signal_name:
+    unit_transform: {scale: 1.0, offset: 0.0}
+
+  - target_column: VehicleInfoADData.AD18FFE313_Steering_Angle
+    required_level: optional_debug
+    source_kind: dbc_signal
+    message_name:
+    signal_name:
+    unit_transform: {scale: 1.0, offset: 0.0}
+
+  - target_column: VehicleInfoADData.AD18F101D0_TCU_CurrentGear
+    required_level: optional_debug
+    source_kind: dbc_signal
+    message_name:
+    signal_name:
+    unit_transform: {scale: 1.0, offset: 0.0}
+
+  - target_column: VehicleInfoADData.AD18FFE213_EHPS_SteerWheelAng
+    required_level: optional_debug
+    source_kind: dbc_signal
+    message_name:
+    signal_name:
+    unit_transform: {scale: 1.0, offset: 0.0}
+
+  - target_column: steering_target
+    required_level: blocking
+    source_kind: dbc_signal
+    message_name:
+    signal_name:
+    unit_transform: {scale: 1.0, offset: 0.0}
+    notes: "ADU 目标方向盘角；如果 BLF 只有实际方向盘角，不能直接替代。"
+
+  - target_column: target_torque
+    required_level: blocking
+    source_kind: dbc_signal
+    message_name:
+    signal_name:
+    unit_transform: {scale: 1.0, offset: 0.0}
+    notes: "目标扭矩或驱动请求扭矩；用于生成四轮扭矩列。"
+
+  - target_column: debug.simple_lon_debug.path_remain
+    required_level: blocking
+    source_kind: derived
+    derive_rule: copy:target_torque
+    notes: "兼容现有 extract_topic_truck_trq.py 中 torque_wheel 的来源列名。"
+
+  - target_column: AlgSysState.TopStateData_Struct.ADS_State
+    required_level: required_for_scene_split
+    source_kind: dbc_signal
+    message_name:
+    signal_name:
+    unit_transform: {scale: 1.0, offset: 0.0}
+    notes: "ADS_State==4 时 controller_enable=1。"
+
+  - target_column: controller_enable
+    required_level: required_for_scene_split
+    source_kind: derived
+    derive_rule: equals:AlgSysState.TopStateData_Struct.ADS_State:4
+
+  # control_debug 字段：普通 CAN 通常没有。默认填 0 并在审计报告中标记。
+  - target_column: debug.simple_lon_debug.station_error
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
+  - target_column: debug.simple_lon_debug.preview_speed_error
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
+  - target_column: debug.simple_lon_debug.current_speed
+    required_level: required_for_scene_split
+    source_kind: derived
+    derive_rule: scale:VehicleInfoBDData.BDCFF10D0_VCU_VehicleSpeed:0.2777777777777778:0.0
+  - target_column: debug.simple_lon_debug.speed_error
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
+  - target_column: debug.simple_lon_debug.acceleration_cmd
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
+  - target_column: debug.simple_lon_debug.current_acceleration
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
+  - target_column: debug.simple_lon_debug.speed_offset
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
+  - target_column: debug.simple_lon_debug.acceleration_cmd_closeloop
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
+  - target_column: debug.simple_lat_debug.lateral_error
+    required_level: required_for_scene_split
+    source_kind: constant
+    fill_value: 0.0
+    notes: "缺失会削弱 lane_change 分类可信度。"
+  - target_column: debug.simple_lat_debug.heading_error
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
+  - target_column: debug.simple_lat_debug.steer_angle
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
+  - target_column: debug.simple_lat_debug.steer_angle_feedforward
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
+  - target_column: debug.simple_lat_debug.steer_angle_feedback
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
+  - target_column: debug.simple_lat_debug.heading_rate
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
+
+  # 规划参考线字段：普通 CAN 通常没有。默认填 0；如果后续 BLF 中有规划 CAN，可改为 dbc_signal。
+  - target_column: ref_kappa
+    required_level: required_for_scene_split
+    source_kind: constant
+    fill_value: 0.0
+    notes: "缺失会影响 turn 分类。"
+  - target_column: ref_dkappa
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
+  - target_column: ref_s
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
+  - target_column: ref_theta
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
+  - target_column: ref_x
+    required_level: required_for_scene_split
+    source_kind: derived
+    derive_rule: copy:position_enu.x
+  - target_column: ref_y
+    required_level: required_for_scene_split
+    source_kind: derived
+    derive_rule: copy:position_enu.y
+  - target_column: ref_v
+    required_level: optional_debug
+    source_kind: derived
+    derive_rule: scale:VehicleInfoBDData.BDCFF10D0_VCU_VehicleSpeed:0.2777777777777778:0.0
+  - target_column: ref_a
+    required_level: optional_debug
+    source_kind: constant
+    fill_value: 0.0
