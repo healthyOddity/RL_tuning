@@ -20,9 +20,9 @@ import torch.nn as nn
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from common import normalize_angle  # 支持 [B] tensor
-from config import (apply_plant_override, load_config, save_tuned_config,
-                    table_from_config)
+from common import normalize_angle, sample_clipped_normal  # 支持 [B] tensor
+from config import (apply_plant_override, apply_runtime_overrides, load_config,
+                    runtime_info, save_tuned_config, table_from_config)
 from controller.lat_truck import LatControllerTruck  # 复用参数导出
 from controller.lon import LonController
 from model.dynamic_vehicle import VehicleDynamics
@@ -419,11 +419,18 @@ class BatchedTruckTrailerVehicle:
                  init_x: torch.Tensor, init_y: torch.Tensor,
                  init_yaw: torch.Tensor, init_v: torch.Tensor,
                  dt: float = 0.02, trailer_mass_kg=None,
-                 checkpoint_path=None):
+                 checkpoint_path=None, capture_mlp: bool = False):
         self.B = batch_size
         params = cfg['truck_trailer_vehicle']
         self.dt = dt
         self.dynamics = TruckTrailerNominalDynamics(params)
+        # MLP I/O 捕获：每步把 raw/norm 输入与 raw/clipped 输出 append 进 list，
+        # 训练默认关；可视化诊断时开。
+        self._capture_mlp = bool(capture_mlp)
+        self._mlp_input_raw_hist: list[torch.Tensor] = []
+        self._mlp_input_norm_hist: list[torch.Tensor] = []
+        self._mlp_output_raw_hist: list[torch.Tensor] = []
+        self._mlp_output_clipped_hist: list[torch.Tensor] = []
 
         self._steer_ratio = float(params['steering_ratio'])
         self._L_t = float(params['L_t'])
@@ -532,24 +539,33 @@ class BatchedTruckTrailerVehicle:
 
         if self._mlp is not None:
             if self._mlp_input_dim == 14:
-                features = build_mlp_input_feature_tensor_v2(
-                    self._state, control, trailer_mass, dt_t)
+                features_raw = build_mlp_input_feature_tensor_v2(
+                    self._state, control, trailer_mass, dt_t, self._b_t)
             else:
-                features = build_mlp_input_feature_tensor(
-                    self._state, control, trailer_mass, dt_t)
+                features_raw = build_mlp_input_feature_tensor(
+                    self._state, control, trailer_mass, dt_t, self._b_t)
             if self._feature_mean is not None:
-                features = (features - self._feature_mean) / self._feature_scale
-            motion_error = self._mlp(features)
+                features = (features_raw - self._feature_mean) / self._feature_scale
+            else:
+                features = features_raw
+            motion_error_raw = self._mlp(features)
             if self._motion_error_clip is not None:
                 motion_error = torch.clamp(
-                    motion_error,
+                    motion_error_raw,
                     -self._motion_error_clip, self._motion_error_clip)
+            else:
+                motion_error = motion_error_raw
+            if self._capture_mlp:
+                self._mlp_input_raw_hist.append(features_raw.detach().clone())
+                self._mlp_input_norm_hist.append(features.detach().clone())
+                self._mlp_output_raw_hist.append(motion_error_raw.detach().clone())
+                self._mlp_output_clipped_hist.append(motion_error.detach().clone())
             if self._mlp_output_dim == 9:
                 full_error = derive_full_error_from_motion_error_torch_v2(
-                    motion_error, base_next, dt_t)
+                    motion_error, base_next, dt_t, self._b_t)
             else:
                 full_error = derive_full_error_from_motion_error_torch(
-                    motion_error, base_next, dt_t)
+                    motion_error, base_next, dt_t, self._b_t)
             new_state = base_next + full_error
             new_state = new_state.clone()
             new_state[:, 2] = wrap_angle_error_torch(new_state[:, 2])
@@ -568,6 +584,47 @@ class BatchedTruckTrailerVehicle:
 
     def detach_state(self):
         self._state = self._state.detach()
+
+    def get_mlp_history(self) -> dict | None:
+        """返回 capture_mlp=True 时积累的 MLP I/O 历史。
+
+        返回 dict 含 4 个 [B, T, D] tensor（input_raw/input_norm 共享 [B,T,input_dim]，
+        output_raw/output_clipped 共享 [B,T,output_dim]）；MLP 未加载或 capture 关
+        时返回 None。
+        """
+        if not self._capture_mlp or self._mlp is None:
+            return None
+        if not self._mlp_input_raw_hist:
+            return None
+        # 每个 list 元素 [B, D]；stack 成 [T, B, D] 再转 [B, T, D]
+        return {
+            'input_raw': torch.stack(self._mlp_input_raw_hist, dim=0)
+                              .transpose(0, 1).contiguous(),
+            'input_norm': torch.stack(self._mlp_input_norm_hist, dim=0)
+                               .transpose(0, 1).contiguous(),
+            'output_raw': torch.stack(self._mlp_output_raw_hist, dim=0)
+                               .transpose(0, 1).contiguous(),
+            'output_clipped': torch.stack(self._mlp_output_clipped_hist, dim=0)
+                                   .transpose(0, 1).contiguous(),
+            'feature_mean': (self._feature_mean.detach().clone()
+                             if self._feature_mean is not None else None),
+            'feature_scale': (self._feature_scale.detach().clone()
+                              if self._feature_scale is not None else None),
+            'motion_error_clip': (self._motion_error_clip.detach().clone()
+                                  if self._motion_error_clip is not None else None),
+            'input_dim': self._mlp_input_dim,
+            'output_dim': self._mlp_output_dim,
+        }
+
+    def set_domain(self, m_t: torch.Tensor, Cf: torch.Tensor, Cr: torch.Tensor):
+        """注入域随机化参数（每 epoch 调一次）。透传到底层 nominal dynamics。
+
+        m_t/Cf/Cr 必须是 shape [B] 张量，与 self.B 对齐。
+        """
+        assert m_t.shape == (self.B,), f"m_t shape {m_t.shape} != ({self.B},)"
+        assert Cf.shape == (self.B,), f"Cf shape {Cf.shape} != ({self.B},)"
+        assert Cr.shape == (self.B,), f"Cr shape {Cr.shape} != ({self.B},)"
+        self.dynamics.set_domain(m_t, Cf, Cr)
 
     @property
     def x(self):
@@ -597,6 +654,13 @@ class BatchedTruckTrailerVehicle:
     @property
     def speed_kph(self):
         return self.v * 3.6
+
+    @property
+    def speed_signed_kph(self):
+        """有符号车体前向速度 (km/h)；正=车头方向前进，负=倒退。
+        纵向控制器用这个量做反馈才能识别"被 MLP/扰动推到反向"，避免
+        |v| 反馈下"刹车扭矩反而加速倒退"的正反馈环。"""
+        return self._state[:, 3] * 3.6
 
     @property
     def yaw_deg(self):
@@ -1016,15 +1080,31 @@ def run_simulation_batch(trajectories: list, cfg: dict = None,
                          lon_ctrl: BatchedLonCtrl = None,
                          tbptt_k: int = 0,
                          hard_mode: bool = False,
-                         trailer_mass_kg=None) -> dict:
+                         trailer_mass_kg=None,
+                         domain_params: dict | None = None,
+                         noise_params: dict | None = None,
+                         dither_params: dict | None = None,
+                         capture_mlp: bool = False) -> dict:
     """B 条轨迹同步推进 50Hz 闭环。支持 truck_trailer / hybrid_dynamic plant。
 
     Args:
         hard_mode: True 时控制器走硬限幅路径（与 V1 scalar run_simulation 等价），
                    整个主循环自动套 torch.no_grad() 省显存/跳过 autograd。
                    False 时走 smooth 近似（训练用，需要梯度回传）。
+                   **hard_mode=True 时即使传入 noise_params/dither_params 也强制
+                   mute**——验证路径只看真值。
         trailer_mass_kg: truck_trailer 专用，标量或 [B] tensor 覆盖默认挂车质量；
                          hybrid_dynamic 下此参数被忽略。
+        domain_params: 可选 dict {'m_t': [B], 'Cf': [B], 'Cr': [B]}。
+                       提供时在创建 vehicle 后调 vehicle.set_domain 注入域参数。
+                       仅 truck_trailer plant 生效，其他 plant 必须为 None。
+        noise_params: 可选 dict，含 enable / sigma_{x_m,y_m,yaw_deg,speed_kph,
+                       yawrate_radps} / clip_sigmas / generator。enable=False 或
+                       None 时不注入；开启时在控制器读取 vehicle 状态之前往真值上加
+                       独立高斯。
+        dither_params: 可选 dict，含 enable / sigma_{delta_rad,torque_nm} /
+                        clip_sigmas / generator。开启时在 vehicle.step 收到指令之前
+                        加高斯抖动；history 仍记录控制器原始输出（不含 dither）。
 
     返回 dict：每项 [B, T_max]，另含 'valid_mask' [B, T_max] 和控制器句柄
     供上层做 loss / 导出用。
@@ -1037,12 +1117,16 @@ def run_simulation_batch(trajectories: list, cfg: dict = None,
     model_type = cfg['vehicle'].get('model_type')
     assert model_type in _SUPPORTED_BATCH_PLANTS, \
         f"run_simulation_batch 仅支持 {_SUPPORTED_BATCH_PLANTS}，当前：{model_type}"
+    if domain_params is not None and model_type != 'truck_trailer':
+        raise NotImplementedError(
+            f"domain_params 仅在 truck_trailer plant 上支持，当前：{model_type}")
 
     grad_ctx = torch.no_grad() if hard_mode else _nullctx()
     with grad_ctx:
         return _run_sim_batch_inner(
             trajectories, cfg, lat_ctrl, lon_ctrl, tbptt_k,
-            hard_mode, trailer_mass_kg)
+            hard_mode, trailer_mass_kg, domain_params,
+            noise_params, dither_params, capture_mlp)
 
 
 class _nullctx:
@@ -1051,7 +1135,9 @@ class _nullctx:
 
 
 def _run_sim_batch_inner(trajectories, cfg, lat_ctrl, lon_ctrl, tbptt_k,
-                         hard_mode, trailer_mass_override):
+                         hard_mode, trailer_mass_override, domain_params=None,
+                         noise_params=None, dither_params=None,
+                         capture_mlp=False):
     bt = BatchedTrajectoryTable(trajectories)
     B, T_max = bt.B, bt.T_max
     dt = cfg['simulation']['dt']
@@ -1067,6 +1153,9 @@ def _run_sim_batch_inner(trajectories, cfg, lat_ctrl, lon_ctrl, tbptt_k,
 
     # 按 plant 类型分发车辆模型
     model_type = cfg['vehicle'].get('model_type')
+    if capture_mlp and model_type != 'truck_trailer':
+        raise NotImplementedError(
+            f"capture_mlp 仅支持 truck_trailer plant，当前：{model_type}")
     if model_type == 'truck_trailer':
         tt_params = cfg['truck_trailer_vehicle']
         if trailer_mass_override is not None:
@@ -1083,7 +1172,12 @@ def _run_sim_batch_inner(trajectories, cfg, lat_ctrl, lon_ctrl, tbptt_k,
             cfg, batch_size=B,
             init_x=bt.init_x, init_y=bt.init_y,
             init_yaw=bt.init_yaw, init_v=bt.init_v,
-            dt=dt, trailer_mass_kg=trailer_mass)
+            dt=dt, trailer_mass_kg=trailer_mass,
+            capture_mlp=capture_mlp)
+        if domain_params is not None:
+            vehicle.set_domain(domain_params['m_t'],
+                               domain_params['Cf'],
+                               domain_params['Cr'])
     elif model_type == 'hybrid_dynamic':
         vehicle = BatchedHybridDynamicVehicle(
             cfg, batch_size=B,
@@ -1106,6 +1200,25 @@ def _run_sim_batch_inner(trajectories, cfg, lat_ctrl, lon_ctrl, tbptt_k,
     prev_steer = torch.zeros(B)
     v_prev = bt.init_v.clone()
 
+    # hard_mode 强制 mute——验证路径只看真值
+    noise_active = (not hard_mode and noise_params is not None
+                    and noise_params.get('enable', False))
+    dither_active = (not hard_mode and dither_params is not None
+                     and dither_params.get('enable', False))
+    if noise_active:
+        n_gen = noise_params.get('generator')
+        n_sx = float(noise_params['sigma_x_m'])
+        n_sy = float(noise_params['sigma_y_m'])
+        n_syaw = float(noise_params['sigma_yaw_deg'])
+        n_sv = float(noise_params['sigma_speed_kph'])
+        n_syr = float(noise_params['sigma_yawrate_radps'])
+        n_clip = float(noise_params.get('clip_sigmas', 3.0))
+    if dither_active:
+        d_gen = dither_params.get('generator')
+        d_sd = float(dither_params['sigma_delta_rad'])
+        d_st = float(dither_params['sigma_torque_nm'])
+        d_clip = float(dither_params.get('clip_sigmas', 3.0))
+
     for step in range(T_max):
         t_now = torch.full((B,), step * dt)
 
@@ -1119,16 +1232,36 @@ def _run_sim_batch_inner(trajectories, cfg, lat_ctrl, lon_ctrl, tbptt_k,
         # 横摆角速度：plant 真实值（动力学积分结果，含 MLP 残差修正）
         yawrate = vehicle.yawrate
 
+        # 控制器读取的状态：默认真值；noise_active 时往真值上加独立高斯
+        # 速度通道 lat / lon 取不同读数（同一传感器、同一噪声样本）：
+        #   - lat 用 |v| 磁量：preview 距离公式假设车在前进，进负值会算"看后视"
+        #   - lon 用 vx_body 有符号：识别倒退，避免"刹车扭矩反而推车后退"的正反馈环
+        if noise_active:
+            x_meas = vehicle.x + sample_clipped_normal(B, n_sx, n_gen, n_clip)
+            y_meas = vehicle.y + sample_clipped_normal(B, n_sy, n_gen, n_clip)
+            yaw_deg_meas = vehicle.yaw_deg + sample_clipped_normal(
+                B, n_syaw, n_gen, n_clip)
+            speed_noise = sample_clipped_normal(B, n_sv, n_gen, n_clip)
+            speed_kph_meas = vehicle.speed_kph + speed_noise
+            speed_signed_kph_meas = vehicle.speed_signed_kph + speed_noise
+            yawrate_meas = yawrate + sample_clipped_normal(
+                B, n_syr, n_gen, n_clip)
+        else:
+            x_meas, y_meas = vehicle.x, vehicle.y
+            yaw_deg_meas, speed_kph_meas = vehicle.yaw_deg, vehicle.speed_kph
+            speed_signed_kph_meas = vehicle.speed_signed_kph
+            yawrate_meas = yawrate
+
         steer_out, _kappa_cur, _nk, curvature_far, steer_fb, steer_ff = \
             lat_ctrl.compute(
-                x=vehicle.x, y=vehicle.y,
-                yaw_deg=vehicle.yaw_deg, speed_kph=vehicle.speed_kph,
-                yawrate=yawrate, steer_feedback=prev_steer,
+                x=x_meas, y=y_meas,
+                yaw_deg=yaw_deg_meas, speed_kph=speed_kph_meas,
+                yawrate=yawrate_meas, steer_feedback=prev_steer,
                 btraj=bt, dt=dt, hard_mode=hard_mode)
 
         acc_cmd = lon_ctrl.compute(
-            x=vehicle.x, y=vehicle.y,
-            yaw_deg=vehicle.yaw_deg, speed_kph=vehicle.speed_kph,
+            x=x_meas, y=y_meas,
+            yaw_deg=yaw_deg_meas, speed_kph=speed_signed_kph_meas,
             curvature_far=curvature_far,
             btraj=bt, t_now=t_now,
             ctrl_first_active=(step == 0), dt=dt, hard_mode=hard_mode)
@@ -1160,15 +1293,24 @@ def _run_sim_batch_inner(trajectories, cfg, lat_ctrl, lon_ctrl, tbptt_k,
         h_ref_x.append(ref['x'])
         h_ref_y.append(ref['y'])
 
+        # 指令送 plant 之前加 dither（history 仍记控制器原始输出）
+        if dither_active:
+            delta_to_plant = delta_front + sample_clipped_normal(
+                B, d_sd, d_gen, d_clip)
+            torque_to_plant = torque_wheel + sample_clipped_normal(
+                B, d_st, d_gen, d_clip)
+        else:
+            delta_to_plant, torque_to_plant = delta_front, torque_wheel
+
         v_prev = vehicle.v.detach()
-        vehicle.step(delta=delta_front, torque_wheel=torque_wheel)
+        vehicle.step(delta=delta_to_plant, torque_wheel=torque_to_plant)
         prev_steer = steer_out
 
     # [T_max, B] → [B, T_max]
     def _stack(seq):
         return torch.stack(seq, dim=0).transpose(0, 1).contiguous()
 
-    return {
+    result = {
         'x': _stack(h_x), 'y': _stack(h_y),
         'yaw': _stack(h_yaw), 'v': _stack(h_v),
         'steer': _stack(h_steer), 'steer_fb': _stack(h_steer_fb),
@@ -1180,6 +1322,11 @@ def _run_sim_batch_inner(trajectories, cfg, lat_ctrl, lon_ctrl, tbptt_k,
         'valid_mask': bt.valid_mask,
         '_lat_ctrl': lat_ctrl, '_lon_ctrl': lon_ctrl, '_btraj': bt,
     }
+    if capture_mlp:
+        mlp_hist = vehicle.get_mlp_history()
+        if mlp_hist is not None:
+            result['mlp_history'] = mlp_hist
+    return result
 
 
 def batched_tracking_loss(history: dict, ref_speeds: torch.Tensor,
@@ -1273,18 +1420,140 @@ def _materialize_trajectories(trajectories):
     raise ValueError(f"无法识别的 trajectories 参数：{type(trajectories)}")
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# 域随机化 helper（仅 truck_trailer）
+# ─────────────────────────────────────────────────────────────────────────
+
+def _resolve_dr_config(cfg: dict, overrides: dict | None = None) -> dict:
+    """合并 cfg['domain_randomization'] 和 CLI 覆盖。
+
+    overrides 中值为 None 的字段表示用户未指定 CLI，回落到 cfg 默认。
+    返回 normalized dict: {enable, K, mt_range, cfcr_range}。
+    """
+    base = cfg.get('domain_randomization') or {}
+    overrides = overrides or {}
+    def _pick(key, default):
+        ov = overrides.get(key)
+        if ov is not None:
+            return ov
+        return base.get(key, default)
+    return {
+        'enable': bool(_pick('enable', False)),
+        'K': int(_pick('K', 4)),
+        'mt_range': float(_pick('mt_range', 0.10)),
+        'cfcr_range': float(_pick('cfcr_range', 0.20)),
+    }
+
+
+def _sample_dr_domains(K: int, mt_range: float, cfcr_range: float,
+                        m_t_nom: float, Cf_nom: float, Cr_nom: float,
+                        generator: torch.Generator | None = None
+                        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """从 ±range 均匀分布采样 K 组 (m_t, Cf, Cr)。
+
+    返回三个 [K] 张量。范围为 nominal × (1 ± range)。
+    """
+    def _u(r):
+        return (torch.rand(K, generator=generator) * 2.0 - 1.0) * r
+    m_t = m_t_nom * (1.0 + _u(mt_range))
+    Cf = Cf_nom * (1.0 + _u(cfcr_range))
+    Cr = Cr_nom * (1.0 + _u(cfcr_range))
+    return m_t.float(), Cf.float(), Cr.float()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 噪声 / 抖动 helper（仅 train_batch.py + truck_trailer 使用）
+# ─────────────────────────────────────────────────────────────────────────
+
+_NOISE_KEYS = ('enable', 'sigma_x_m', 'sigma_y_m', 'sigma_yaw_deg',
+               'sigma_speed_kph', 'sigma_yawrate_radps', 'clip_sigmas')
+
+_DITHER_KEYS = ('enable', 'sigma_delta_rad', 'sigma_torque_nm', 'clip_sigmas')
+
+
+_NOISE_DEFAULTS = {
+    'enable': False,
+    'sigma_x_m': 0.02,
+    'sigma_y_m': 0.02,
+    'sigma_yaw_deg': 0.115,
+    'sigma_speed_kph': 0.18,
+    'sigma_yawrate_radps': 0.002,
+    'clip_sigmas': 3.0,
+}
+
+_DITHER_DEFAULTS = {
+    'enable': False,
+    'sigma_delta_rad': 0.001,
+    'sigma_torque_nm': 15.0,
+    'clip_sigmas': 3.0,
+}
+
+
+def _resolve_noise_config(cfg: dict, overrides: dict | None = None) -> dict:
+    """合并 cfg['feedback_noise'] 与 CLI overrides。CLI 非 None 时优先；
+    yaml 缺该 section 或某 key 留空（None）都回退到默认值。"""
+    out = dict(_NOISE_DEFAULTS)
+    base = cfg.get('feedback_noise') or {}
+    for k in _NOISE_KEYS:
+        v = base.get(k)
+        if v is not None:
+            out[k] = v
+    if overrides:
+        for k in _NOISE_KEYS:
+            v = overrides.get(k)
+            if v is not None:
+                out[k] = v
+    return out
+
+
+def _resolve_dither_config(cfg: dict, overrides: dict | None = None) -> dict:
+    """合并 cfg['command_dither'] 与 CLI overrides。CLI 非 None 时优先；
+    yaml 缺该 section 或某 key 留空（None）都回退到默认值。"""
+    out = dict(_DITHER_DEFAULTS)
+    base = cfg.get('command_dither') or {}
+    for k in _DITHER_KEYS:
+        v = base.get(k)
+        if v is not None:
+            out[k] = v
+    if overrides:
+        for k in _DITHER_KEYS:
+            v = overrides.get(k)
+            if v is not None:
+                out[k] = v
+    return out
+
+
 def train_batch(trajectories=None, n_epochs: int = 100, lr: float = 5e-2,
                 lr_tables: float = 5e-2, tbptt_k: int = 150,
                 grad_clip: float = 10.0, verbose: bool = True,
                 plant: str = None, config_path: str = None,
                 w_lat: float = 10.0, w_head: float = 8.0, w_speed: float = 3.0,
                 w_steer_rate: float = 0.05, w_acc_rate: float = 0.01,
-                param_snapshot_interval: int = 10):
+                param_snapshot_interval: int = 10,
+                dr_overrides: dict | None = None,
+                disable_mlp: bool = False,
+                dr_seed: int | None = None,
+                noise_overrides: dict | None = None,
+                dither_overrides: dict | None = None,
+                noise_seed: int | None = None):
     """批量版训练入口。梯度/优化/归一化/投影/导出语义与 scalar train() 等价。
+
+    Args:
+        dr_overrides: 域随机化 CLI 覆盖 dict（含 enable/K/mt_range/cfcr_range，
+                      值为 None 表示回落到 cfg['domain_randomization']）。
+                      是否启用 MLP 与 DR 解耦：以 cfg['truck_trailer_vehicle']
+                      ['checkpoint_path'] 与 disable_mlp 入参为准。
+        disable_mlp: 训练时跳过 MLP 残差（cfg 的 checkpoint_path 置空）。
+        dr_seed: 采样随机种子（None 不固定，方便复现实验时指定）。
+        noise_overrides: 状态反馈噪声 CLI 覆盖 dict，键见 _NOISE_KEYS；None 走 cfg。
+        dither_overrides: 指令抖动 CLI 覆盖 dict，键见 _DITHER_KEYS；None 走 cfg。
+        noise_seed: 噪声 + 抖动共用的随机种子（None 不固定）。与 dr_seed 解耦，
+                    便于跑"同物理 / 不同噪声"的对比实验。
 
     返回 dict: {'losses', 'training_history', 'initial_params', 'final_params',
                 'saved_path', 'trajectory_types', 'trajectory_keys',
-                'lat_ctrl', 'lon_ctrl'}
+                'lat_ctrl', 'lon_ctrl', 'dr_config', 'noise_config',
+                'dither_config', 'noise_seed'}
     """
     cfg = load_config(config_path)
     if plant:
@@ -1292,10 +1561,35 @@ def train_batch(trajectories=None, n_epochs: int = 100, lr: float = 5e-2,
     assert cfg['vehicle'].get('model_type') == 'truck_trailer', \
         "train_batch 目前仅支持 truck_trailer plant"
 
+    dr_config = _resolve_dr_config(cfg, dr_overrides)
+    noise_config = _resolve_noise_config(cfg, noise_overrides)
+    dither_config = _resolve_dither_config(cfg, dither_overrides)
+    # 是否使用 MLP 与 DR 解耦：仅由 cfg['truck_trailer_vehicle']['checkpoint_path']
+    # 与 disable_mlp 入参决定。注意：MLP 是按 nominal 车辆参数训练的，DR 把车辆
+    # 参数推到 ±10/20% 区间时 MLP 输入分布偏移训练域，残差解释力下降。
+    if disable_mlp:
+        apply_runtime_overrides(cfg, disable_mlp=True)
+    # 训练实际加载的 MLP checkpoint（disable_mlp 后 overrides 已清空 → 空串=不带 MLP）
+    mlp_checkpoint_used = (cfg.get('truck_trailer_vehicle') or {}).get(
+        'checkpoint_path', '') or ''
+
     pairs = _materialize_trajectories(trajectories)
-    keys = [k for k, _t in pairs]
-    trajs = [t for _k, t in pairs]
-    B = len(trajs)
+    keys_orig = [k for k, _t in pairs]
+    trajs_orig = [t for _k, t in pairs]
+    B_orig = len(trajs_orig)
+
+    if dr_config['enable']:
+        K = dr_config['K']
+        # python list × K 复制：[t0, t1, ..., t_{B-1}] × K
+        # → 元素 i 的 traj_idx = i % B_orig，domain_idx = i // B_orig
+        trajs = trajs_orig * K
+        keys = keys_orig * K
+        B = B_orig * K
+    else:
+        K = 1
+        trajs = trajs_orig
+        keys = keys_orig
+        B = B_orig
 
     if verbose:
         if isinstance(trajectories, list) and trajectories and isinstance(
@@ -1304,15 +1598,65 @@ def train_batch(trajectories=None, n_epochs: int = 100, lr: float = 5e-2,
         elif trajectories is None:
             n_types = len(TRAJECTORY_TYPES)
         else:
-            n_types = B
+            n_types = B_orig
         print(f"批量训练轨迹: {n_types} 类型 × {len(SPEED_BANDS_KPH)} 速度段 "
-              f"= {B} 条 (batch 维 B={B})")
+              f"= {B_orig} 条 (batch 维 B={B})")
         print(f"  速度段: {SPEED_BANDS_KPH} kph")
+        if dr_config['enable']:
+            print(f"  域随机化: K={K} 组/epoch, "
+                  f"m_t±{dr_config['mt_range']*100:.0f}%, "
+                  f"Cf/Cr±{dr_config['cfcr_range']*100:.0f}%")
+        if disable_mlp:
+            print(f"  MLP 已关闭（纯机理 base 路径）")
+        else:
+            ckpt = cfg['truck_trailer_vehicle'].get('checkpoint_path', '')
+            if ckpt:
+                print(f"  MLP 已启用: {ckpt}")
 
     lat_ctrl = BatchedLatTruck(cfg, batch_size=B)
     lon_ctrl = BatchedLonCtrl(cfg, batch_size=B)
 
     ref_speeds = torch.tensor([float(t[0].v) for t in trajs])
+
+    # DR 采样 nominal 值与生成器（仅 enable 时使用）
+    if dr_config['enable']:
+        tt_params = cfg['truck_trailer_vehicle']
+        dr_nominal = (float(tt_params['m_t']),
+                      float(tt_params['Cf']),
+                      float(tt_params['Cr']))
+        dr_generator = (torch.Generator().manual_seed(int(dr_seed))
+                        if dr_seed is not None else None)
+    else:
+        dr_nominal = None
+        dr_generator = None
+
+    # 噪声 / 抖动 共用同一个 Generator（noise_seed 锁住 7 个采样调用顺序）
+    if noise_config['enable'] or dither_config['enable']:
+        noise_generator = (torch.Generator().manual_seed(int(noise_seed))
+                           if noise_seed is not None else None)
+    else:
+        noise_generator = None
+    noise_params_for_run = None
+    dither_params_for_run = None
+    if noise_config['enable']:
+        noise_params_for_run = dict(noise_config)
+        noise_params_for_run['generator'] = noise_generator
+    if dither_config['enable']:
+        dither_params_for_run = dict(dither_config)
+        dither_params_for_run['generator'] = noise_generator
+
+    if verbose:
+        if noise_config['enable']:
+            print(f"  状态噪声: x/y σ={noise_config['sigma_x_m']:.3f}m, "
+                  f"yaw σ={noise_config['sigma_yaw_deg']:.3f}°, "
+                  f"speed σ={noise_config['sigma_speed_kph']:.3f}km/h, "
+                  f"yawrate σ={noise_config['sigma_yawrate_radps']:.4f}rad/s, "
+                  f"clip {noise_config['clip_sigmas']:.1f}σ"
+                  f"{f'  seed={noise_seed}' if noise_seed is not None else ''}")
+        if dither_config['enable']:
+            print(f"  指令抖动: delta σ={dither_config['sigma_delta_rad']:.4f}rad, "
+                  f"torque σ={dither_config['sigma_torque_nm']:.1f}N·m, "
+                  f"clip {dither_config['clip_sigmas']:.1f}σ")
 
     # 分组 lr（table y 用 lr_tables，其他用 lr）
     table_params, other_params = [], []
@@ -1346,9 +1690,24 @@ def train_batch(trajectories=None, n_epochs: int = 100, lr: float = 5e-2,
         te = time.time()
         optimizer.zero_grad()
 
+        # 域随机化：每 epoch 重采样 K 组 (m_t, Cf, Cr)
+        domain_params = None
+        epoch_domains_K = None  # [K, 3] 当前 epoch 的 nominal 缩放后值
+        if dr_config['enable']:
+            mt_K, cf_K, cr_K = _sample_dr_domains(
+                K, dr_config['mt_range'], dr_config['cfcr_range'],
+                *dr_nominal, generator=dr_generator)
+            mt_B = mt_K.repeat_interleave(B_orig)
+            cf_B = cf_K.repeat_interleave(B_orig)
+            cr_B = cr_K.repeat_interleave(B_orig)
+            domain_params = {'m_t': mt_B, 'Cf': cf_B, 'Cr': cr_B}
+            epoch_domains_K = torch.stack([mt_K, cf_K, cr_K], dim=1)
+
         history = run_simulation_batch(
             trajs, cfg=cfg, lat_ctrl=lat_ctrl, lon_ctrl=lon_ctrl,
-            tbptt_k=tbptt_k)
+            tbptt_k=tbptt_k, domain_params=domain_params,
+            noise_params=noise_params_for_run,
+            dither_params=dither_params_for_run)
 
         per_traj, details = batched_tracking_loss(
             history, ref_speeds,
@@ -1357,8 +1716,16 @@ def train_batch(trajectories=None, n_epochs: int = 100, lr: float = 5e-2,
             return_details=True)
 
         # Per-traj 软归一化（第 1 epoch 记 baseline，后续归一化）
+        # DR 启用时 baseline 在 K 个 domain 副本上取均值，再复制回 [B]
         if epoch == 0:
-            baseline_per_traj = per_traj.detach().clamp(min=1e-6)
+            base_raw = per_traj.detach().clamp(min=1e-6)  # [B]
+            if dr_config['enable']:
+                # [B = K * B_orig] → view(K, B_orig) → mean over K → [B_orig]
+                base_per_traj_orig = base_raw.view(K, B_orig).mean(dim=0)
+                # 复制回 [B]：每个 domain 副本共享同一 baseline
+                baseline_per_traj = base_per_traj_orig.repeat(K)
+            else:
+                baseline_per_traj = base_raw
             sorted_b = baseline_per_traj.sort().values
             median_b = sorted_b[len(sorted_b) // 2].item()
             norm_floor = median_b ** norm_alpha
@@ -1407,23 +1774,29 @@ def train_batch(trajectories=None, n_epochs: int = 100, lr: float = 5e-2,
         dt_epoch = time.time() - te
 
         # 汇总轨迹明细（对齐 scalar 训练日志结构）
+        # DR 启用时同 traj_key 在 K 个 domain 上的指标取均值，保持下游
+        # post_training 看到的 per_trajectory 结构与无 DR 时一致
         per_trajectory = {}
-        for i, key in enumerate(keys):
+        for j, key in enumerate(keys_orig):
+            indices = [j + k * B_orig for k in range(K)]
             per_trajectory[key] = {
-                'lat_rmse': float(details['lat_rmse'][i]),
-                'head_rmse': float(details['head_rmse'][i]),
-                'speed_rmse': float(details['speed_rmse'][i]),
-                'lat_max': float(details['lat_max'][i]),
-                'head_max': float(details['head_max'][i]),
-                'loss_lat': float(details['loss_lat'][i]),
-                'loss_head': float(details['loss_head'][i]),
-                'loss_speed': float(details['loss_speed'][i]),
-                'loss_steer_rate': float(details['loss_steer_rate'][i]),
-                'loss_acc_rate': float(details['loss_acc_rate'][i]),
+                'lat_rmse': float(details['lat_rmse'][indices].mean()),
+                'head_rmse': float(details['head_rmse'][indices].mean()),
+                'speed_rmse': float(details['speed_rmse'][indices].mean()),
+                'lat_max': float(details['lat_max'][indices].max()),
+                'head_max': float(details['head_max'][indices].max()),
+                'loss_lat': float(details['loss_lat'][indices].mean()),
+                'loss_head': float(details['loss_head'][indices].mean()),
+                'loss_speed': float(details['loss_speed'][indices].mean()),
+                'loss_steer_rate': float(
+                    details['loss_steer_rate'][indices].mean()),
+                'loss_acc_rate': float(
+                    details['loss_acc_rate'][indices].mean()),
             }
         avg = {k: float(details[k].mean().item()) for k in details}
 
-        training_history.append({
+        # DR：每 epoch 记 K 个 domain 的具体值 + 各自平均 loss
+        epoch_record = {
             'epoch': epoch + 1,
             'loss': loss_val,
             'grad_norm': grad_norm,
@@ -1431,7 +1804,18 @@ def train_batch(trajectories=None, n_epochs: int = 100, lr: float = 5e-2,
             'dt': dt_epoch,
             'per_trajectory': per_trajectory,
             'avg': avg,
-        })
+        }
+        if dr_config['enable']:
+            per_domain_loss = per_traj.detach().view(K, B_orig).mean(dim=1)
+            epoch_record['dr_domains'] = {
+                f'd{k}': {
+                    'm_t': float(epoch_domains_K[k, 0]),
+                    'Cf': float(epoch_domains_K[k, 1]),
+                    'Cr': float(epoch_domains_K[k, 2]),
+                    'mean_loss': float(per_domain_loss[k]),
+                } for k in range(K)
+            }
+        training_history.append(epoch_record)
 
         if verbose:
             warn = f" [!NaN grads:{int(nan_count)}]" if nan_count > 0 else ""
@@ -1443,8 +1827,19 @@ def train_batch(trajectories=None, n_epochs: int = 100, lr: float = 5e-2,
                   f"dt={dt_epoch:.1f}s B={B}{warn}",
                   flush=True)
 
-            if B > 1:
-                for key in keys:
+            if dr_config['enable']:
+                # 4 个 domain 的样本值 + 各自 mean loss + worst domain 标记
+                per_domain_loss = per_traj.detach().view(K, B_orig).mean(dim=1)
+                worst_k = int(per_domain_loss.argmax())
+                for k in range(K):
+                    mark = ' (worst)' if k == worst_k else ''
+                    print(f"    domain[{k}]: m_t={epoch_domains_K[k,0]:7.1f}kg "
+                          f"Cf={epoch_domains_K[k,1]:7.0f} "
+                          f"Cr={epoch_domains_K[k,2]:7.0f} | "
+                          f"mean_loss={per_domain_loss[k]:.4f}{mark}")
+
+            if B_orig > 1:
+                for key in keys_orig:
                     td = per_trajectory[key]
                     print(f"    {key:30s}: lat={td['lat_rmse']:.4f} "
                           f"head={td['head_rmse']:.4f} spd={td['speed_rmse']:.4f} | "
@@ -1488,14 +1883,16 @@ def train_batch(trajectories=None, n_epochs: int = 100, lr: float = 5e-2,
     elif trajectories is None:
         type_names = list(TRAJECTORY_TYPES)
     else:
-        type_names = keys
+        type_names = keys_orig
 
-    saved_path = save_tuned_config(cfg_out, meta={
+    meta = {
         'final_loss': losses[-1],
         'initial_loss': losses[0],
         'epochs': n_epochs,
+        'plant': 'truck_trailer',
+        'config_path': config_path,
         'trajectory_types': type_names,
-        'trajectory_count': B,
+        'trajectory_count': B_orig,
         'speed_bands_kph': SPEED_BANDS_KPH,
         'lr': lr,
         'lr_tables': lr_tables,
@@ -1504,9 +1901,27 @@ def train_batch(trajectories=None, n_epochs: int = 100, lr: float = 5e-2,
         'w_lat': w_lat,
         'w_head': w_head,
         'w_speed': w_speed,
+        'w_steer_rate': w_steer_rate,
+        'w_acc_rate': w_acc_rate,
+        'param_snapshot_interval': param_snapshot_interval,
+        'disable_mlp': bool(disable_mlp),
         'total_time_s': round(total_time, 1),
         'batched': True,
-    })
+        'runtime': runtime_info(),
+    }
+    if dr_config['enable']:
+        meta['domain_randomization'] = {
+            'enable': True,
+            'K': K,
+            'mt_range': dr_config['mt_range'],
+            'cfcr_range': dr_config['cfcr_range'],
+            'mt_nominal': dr_nominal[0],
+            'Cf_nominal': dr_nominal[1],
+            'Cr_nominal': dr_nominal[2],
+            'effective_batch': B,
+            'dr_seed': dr_seed,
+        }
+    saved_path = save_tuned_config(cfg_out, meta=meta)
     if verbose:
         print(f"参数已保存: {saved_path}")
 
@@ -1514,7 +1929,7 @@ def train_batch(trajectories=None, n_epochs: int = 100, lr: float = 5e-2,
         'losses': losses,
         'training_history': training_history,
         'trajectory_types': type_names,
-        'trajectory_keys': keys,
+        'trajectory_keys': keys_orig,
         'initial_params': {name: p.cpu().tolist() if p.numel() > 1 else p.item()
                            for name, p in initial_params.items()},
         'final_params': {name: p.detach().cpu().tolist() if p.numel() > 1 else p.detach().item()
@@ -1522,6 +1937,12 @@ def train_batch(trajectories=None, n_epochs: int = 100, lr: float = 5e-2,
         'saved_path': saved_path,
         'lat_ctrl': lat_ctrl,
         'lon_ctrl': lon_ctrl,
+        'dr_config': dr_config,
+        'noise_config': noise_config,
+        'dither_config': dither_config,
+        'noise_seed': noise_seed,
+        'disable_mlp': disable_mlp,
+        'mlp_checkpoint': mlp_checkpoint_used,
     }
 
 
@@ -1560,7 +1981,70 @@ if __name__ == '__main__':
                         help='训练完不跑 post_training 自动化')
     parser.add_argument('--scalar-validation', action='store_true',
                         help='post_training 的 V1 验证走 scalar per-scene 路径（默认并行 batched）')
+    # 域随机化（CLI 仅作覆盖；未指定时用 cfg['domain_randomization']）
+    parser.add_argument('--dr-enable', action='store_true', default=None,
+                        help='启用域随机化（覆盖 cfg；MLP 开关由 yaml/CLI 决定）')
+    parser.add_argument('--dr-K', type=int, default=None,
+                        help='每 epoch 采样的 domain 数（默认 cfg=4）')
+    parser.add_argument('--dr-mt-range', type=float, default=None,
+                        help='m_t 相对 nominal 的 ±range（默认 cfg=0.10）')
+    parser.add_argument('--dr-cfcr-range', type=float, default=None,
+                        help='Cf/Cr 相对 nominal 的 ±range（默认 cfg=0.20）')
+    parser.add_argument('--dr-seed', type=int, default=None,
+                        help='DR 采样随机种子（None 不固定）')
+    # 状态反馈噪声（CLI 优先；默认走 cfg['feedback_noise']）
+    parser.add_argument('--noise-enable', dest='noise_enable',
+                        action='store_true', default=None,
+                        help='启用状态反馈噪声（覆盖 cfg）')
+    parser.add_argument('--no-noise', dest='noise_enable',
+                        action='store_false',
+                        help='强制关闭状态反馈噪声（覆盖 cfg）')
+    parser.add_argument('--sigma-x', type=float, default=None,
+                        help='位置 x 噪声 σ (m)')
+    parser.add_argument('--sigma-y', type=float, default=None,
+                        help='位置 y 噪声 σ (m)')
+    parser.add_argument('--sigma-yaw', type=float, default=None,
+                        help='朝向噪声 σ (deg)')
+    parser.add_argument('--sigma-speed', type=float, default=None,
+                        help='车速噪声 σ (km/h)')
+    parser.add_argument('--sigma-yawrate', type=float, default=None,
+                        help='横摆率噪声 σ (rad/s)')
+    # 指令抖动
+    parser.add_argument('--dither-enable', dest='dither_enable',
+                        action='store_true', default=None,
+                        help='启用指令高频抖动（覆盖 cfg）')
+    parser.add_argument('--no-dither', dest='dither_enable',
+                        action='store_false',
+                        help='强制关闭指令抖动（覆盖 cfg）')
+    parser.add_argument('--sigma-delta', type=float, default=None,
+                        help='delta 抖动 σ (rad)')
+    parser.add_argument('--sigma-torque', type=float, default=None,
+                        help='torque 抖动 σ (N·m)')
+    parser.add_argument('--noise-seed', type=int, default=None,
+                        help='噪声 + 抖动共用的随机种子（None 不固定）')
+    parser.add_argument('--disable-mlp', action='store_true',
+                        help='训练 + 验证全程关 MLP（cfg checkpoint_path 置空）')
     args = parser.parse_args()
+
+    dr_overrides = {
+        'enable': args.dr_enable,
+        'K': args.dr_K,
+        'mt_range': args.dr_mt_range,
+        'cfcr_range': args.dr_cfcr_range,
+    }
+    noise_overrides = {
+        'enable': args.noise_enable,
+        'sigma_x_m': args.sigma_x,
+        'sigma_y_m': args.sigma_y,
+        'sigma_yaw_deg': args.sigma_yaw,
+        'sigma_speed_kph': args.sigma_speed,
+        'sigma_yawrate_radps': args.sigma_yawrate,
+    }
+    dither_overrides = {
+        'enable': args.dither_enable,
+        'sigma_delta_rad': args.sigma_delta,
+        'sigma_torque_nm': args.sigma_torque,
+    }
 
     result = train_batch(
         trajectories=args.trajectories, n_epochs=args.epochs,
@@ -1569,16 +2053,27 @@ if __name__ == '__main__':
         plant=args.plant or 'truck_trailer', config_path=args.config,
         w_lat=args.w_lat, w_head=args.w_head, w_speed=args.w_speed,
         w_steer_rate=args.w_steer_rate, w_acc_rate=args.w_acc_rate,
-        param_snapshot_interval=args.snapshot_interval)
+        param_snapshot_interval=args.snapshot_interval,
+        dr_overrides=dr_overrides,
+        disable_mlp=args.disable_mlp,
+        dr_seed=args.dr_seed,
+        noise_overrides=noise_overrides,
+        dither_overrides=dither_overrides,
+        noise_seed=args.noise_seed)
 
     print(f"\n最终 loss: {result['losses'][-1]:.6f}")
     print(f"保存路径: {result['saved_path']}")
+
+    # post_training 验证：与训练端配置一致（disable_mlp 透传，DR 不再额外强制）
+    validation_disable_mlp = bool(result.get('disable_mlp', False))
 
     if not args.no_post_training:
         # post_training 默认走 batched V1（49 场景并行 hard_mode），~6 min；
         # --scalar-validation 退回 scalar per-scene 路径 ~10 min（回归调试用）
         cfg = load_config(args.config)
         apply_plant_override(cfg, 'truck_trailer')
+        if validation_disable_mlp:
+            apply_runtime_overrides(cfg, disable_mlp=True)
         scalar_params = _build_scalar_params_for_post_training(
             result['lat_ctrl'], result['lon_ctrl'], cfg)
         result['params'] = scalar_params  # post_training 约定字段
@@ -1588,9 +2083,23 @@ if __name__ == '__main__':
             'trajectory_types': result['trajectory_types'],
             'tbptt_k': args.tbptt_k, 'grad_clip': args.grad_clip,
             'plant': 'truck_trailer',
+            'config_path': args.config,
             'w_lat': args.w_lat, 'w_head': args.w_head, 'w_speed': args.w_speed,
+            'w_steer_rate': args.w_steer_rate, 'w_acc_rate': args.w_acc_rate,
+            'snapshot_interval': args.snapshot_interval,
+            'scalar_validation': args.scalar_validation,
             'batched': True,
+            'disable_mlp': validation_disable_mlp,
+            'domain_randomization': result.get('dr_config'),
+            'dr_seed': args.dr_seed,
+            'feedback_noise': result.get('noise_config'),
+            'command_dither': result.get('dither_config'),
+            'noise_seed': args.noise_seed,
+            'mlp_checkpoint': result.get('mlp_checkpoint', ''),
+            'runtime': runtime_info(include_argv=True),
         }
         run_post_training(result, hyperparams, plant='truck_trailer',
                           trajectory_types=args.trajectories,
-                          use_batched=not args.scalar_validation)
+                          use_batched=not args.scalar_validation,
+                          baseline_config_path=args.config,
+                          disable_mlp=validation_disable_mlp)

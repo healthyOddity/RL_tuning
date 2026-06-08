@@ -54,11 +54,20 @@ sim/
 │   │   ├── kinematic/     # 运动学模型基线
 │   │   ├── dynamic/       # 动力学模型基线
 │   │   └── hybrid_dynamic/ # 混合模型基线
-│   └── training/          # 训练产物（.gitignore 排除，按被控对象+时间戳分目录）
-│       └── {plant}/{timestamp}/  # loss_curve.png, loss_breakdown.png, comparison_*.png, experiment_log.yaml
+│   ├── training/          # 训练产物（.gitignore 排除，按被控对象+时间戳分目录）
+│   │   └── {plant}/{timestamp}/  # loss_curve.png, loss_breakdown.png, comparison_*.png, experiment_log.yaml
+│   └── diagnostic/        # 调研产物（纳入 git，按主题分目录）
+│       ├── mlp_instability/{ckpt}/   # MLP 失控诊断结果图（panel/early/danger/RCS/static/cross，4 场景 × 8 变体）
+│       └── mlp_output_panels/{ckpt}/ # 49 场景全量 MLP 输出 panel（单 MLP，无变体对比）
 ├── learn/                 # 学习笔记与调试日志（不影响运行）
+├── debug/                 # 调研与一次性脚本；MLP 失控诊断套件已纳入 git
 └── tests/                 # pytest 测试
 ```
+
+`sim/debug/` 约定：脚本头加 `sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))` 把 `sim/` 加进 path，再 `from config import ...`。临时排查脚本可保持 untracked（跟随 git status 提示）；常态化的诊断套件按主题归一并纳入 git，目前已固化的：
+
+- **MLP 失控诊断** (`run_for_ckpt.py` 入口)：给定任意 truck_trailer MLP checkpoint，自动跑 4 场景闭环 × 8 变体（含组件消融），生成轨迹偏离/输出量级时序/输入空间危险区热图等全套图，按 `<ckpt>` 名落到 `results/diagnostic/mlp_instability/<ckpt>/`。复用已有 4 个绘图脚本（`investigate_mlp_instability.py / plot_mlp_instability.py / plot_root_cause_story.py / plot_mlp_danger_zones.py`）+ 跨 ckpt 对比 (`plot_compare_ckpts.py`)。详见 [`docs/plans/2026-05-08-0507-mlp-instability-rootcause.md`](../docs/plans/2026-05-08-0507-mlp-instability-rootcause.md)。
+- **全场景 MLP 输出 panel** (`plot_mlp_outputs_all_scenarios.py`)：一次并行跑完 49 条评估轨迹（`run_simulation_batch(hard_mode=True, capture_mlp=True)`），按 batch index 拆开，串行画每场景一张 4×3 panel（行 1 轨迹+横向误差+OOD，行 2-4 完整 9D MLP 输出）。**只画目标 MLP，无变体对比**——适合做"上线 ckpt × 全场景"的鸟瞰，输出落到 `results/diagnostic/mlp_output_panels/<ckpt>/`，单 ckpt 全套 ~3-4 min。
 
 ## 数据流
 
@@ -88,6 +97,9 @@ python optim/train.py --config configs/tuned/xxx.yaml --epochs 6  # warm-start �
 python optim/train.py --plant hybrid_dynamic --epochs 6     # 指定被控对象
 python optim/train_batch.py --epochs 6 --plant truck_trailer  # 批量并行训练 + 并行 V1 验证（总约 11 min）
 python optim/train_batch.py --scalar-validation --epochs 6 --plant truck_trailer  # 训练并行+验证串行（回归调试用）
+python optim/train_batch.py --plant truck_trailer --dr-enable --dr-seed 2026 --epochs 6  # 域随机化训练（K=4 默认，每 epoch 采样 4 组车辆参数）
+python optim/train_batch.py --plant truck_trailer --dr-enable --noise-enable --dither-enable --dr-seed 2026 --noise-seed 2026 --epochs 6  # 激进 DR：物理 + 噪声 + 抖动叠加训练
+python optim/train_batch.py --plant truck_trailer --disable-mlp --epochs 6  # 关闭 MLP 残差，纯机理 base 训练
 python optim/validate_batch.py --config configs/tuned/xxx.yaml --plant truck_trailer  # 自定义 A/B 对比（并行，支持 label 自定义）
 python optim/post_training.py --config configs/tuned/xxx.yaml              # 独立验证（全量 49 场景，默认 scalar）
 python optim/post_training.py --config configs/tuned/xxx.yaml --batched --plant truck_trailer  # 独立验证（并行批量）
@@ -110,6 +122,10 @@ python optim/post_training.py --config configs/tuned/xxx.yaml --plant dynamic  #
 | `--plant` | None | 被控对象：kinematic / dynamic / hybrid_dynamic |
 | `--config` | None | warm-start 配置文件路径 |
 | `--w-lat/head/speed` | 10/8/3 | loss 权重（横向/航向/速度） |
+
+## train_batch.py 专属参数
+
+`--scalar-validation`（V1 验证退回串行 per-scene）、`--no-post-training`、`--disable-mlp`（训练+验证全程关 MLP）、`--dr-enable / --dr-K / --dr-mt-range / --dr-cfcr-range / --dr-seed`（域随机化，详见下面 DR 段）。完整默认值与 yaml 对应字段见 `argparse` 帮助 (`python optim/train_batch.py -h`) 与 `default.yaml`。
 | `--w-steer-rate/acc-rate` | 0.05/0.01 | 平滑度正则权重 |
 
 ## 与 controller_spec_v2.md 的差异
@@ -200,7 +216,7 @@ python optim/post_training.py --config configs/tuned/xxx.yaml --plant dynamic  #
 
 - **底层动力学已本地化**在 `sim/model/truck_trailer_dynamics.py`（来自上游 `mutespeaker/truckdynamicmodel` 的拷贝）；checkpoint 也在 `sim/configs/checkpoints/`；无任何外部仓库依赖
 - **状态 12D**：牵引车质心 6D + 挂车质心 6D；对外暴露**牵引车后轴** x/y/yaw/v（控制器约定）
-- **质心↔后轴偏移**：b_t = L_t − a_t = 0.675 m（适配器 4 个 property 各做一次坐标转换）
+- **质心↔后轴偏移**：b_t = L_t − a_t（当前空载工况:4.483 − 2.21 = 2.273 m;适配器 4 个 property 各做一次坐标转换）
 - **Base 用 RK4 积分**（和 hybrid_dynamic 用 Euler 不同；MLP 训练时 base 也是 RK4）
 - **挂车质量 yaml 可配**：`default_trailer_mass_kg`，默认 0 kg（无挂车）；< 1.0 kg 自动进入无挂车模式（底层强制 `挂车态=牵引车态`）；当前 MLP checkpoint 输入特征里有显式 `has_trailer` 标志，可直接切换
 - **底层车轮假设**：外部 base model 的控制量是 `[方向盘角, T_fl, T_fr, T_rl, T_rr]` = 4 轮，其中前轮扭矩始终为 0（等效 4×2 单后桥驱动）；适配器把纵向控制器给的总扭矩 `torque_wheel` 平分到左右后轮
@@ -233,6 +249,20 @@ scalar `optim/train.py` 把 48 条轨迹串行跑，单 epoch 约 40 分钟。`o
 - 变长轨迹用 `padding + valid_mask` 处理，padding 位置的 ref 值填末尾值；loss 仅在 `mask=1` 的 step 上累加
 - TBPTT：所有 batch 元素同步 `detach()`；PID/IIR/rate_limit 内部状态 shape `[B]` 独立演化
 - `torch.where` 精确复刻 scalar 分支（尤其 `station_fnl` 低速段 if/elif 链），避免 smooth 近似带来的系统偏差
+
+## 域随机化 (`--dr-enable`，仅 `train_batch.py` + `truck_trailer`)
+
+每 epoch 开头采样 K 组 `(m_t, Cf, Cr)`（独立均匀分布在 ±range 内，`Iz_t` 跟随 `m_t` 线性缩放），把 48 条轨迹复制 K 份分别绑域，B 扩到 48×K，一次平均反传更新让控制器对一族车辆物理鲁棒。配置入口 `default.yaml` 的 `domain_randomization` 段；CLI 优先级高于 yaml；`--dr-seed` 锁可复现。**MLP 开关与 DR 正交**——是否带 MLP 由 `checkpoint_path` 和 `--disable-mlp` 决定，代码不强制（MLP 按 nominal 训练，DR 范围外残差失真，由使用方按场景权衡）。耗时 K=4 单 epoch ~8 min（vs 无 DR 5 min）。详见 `docs/plans/2026-05-08-domain-randomization-design.md`。
+
+### 状态反馈噪声 + 指令抖动（叠加在 DR 之上）
+
+`--noise-enable` 在控制器读取 vehicle 状态之前往真值上加独立高斯（5 通道：x/y/yaw/speed/yawrate），`--dither-enable` 在 vehicle.step 收到指令之前给 delta/torque 加高斯抖动；两者均为单步白噪声、3σ 截断、噪声/抖动共用同一个 `torch.Generator`，由 `--noise-seed` 锁种子（与 `--dr-seed` 解耦）。loss 始终用 vehicle 真值；`hard_mode=True` 验证路径强制 mute——所以 V1 49 场景对比仍然干净。
+
+yaml 配置入口 `feedback_noise` / `command_dither`，CLI 优先级高于 yaml；σ 一次性覆盖通过 `--sigma-{x,y,yaw,speed,yawrate,delta,torque}` 传入。详见 `docs/plans/2026-05-08-aggressive-dr-noise-dither-design.md`。
+
+## 训练记录
+
+`tuned_xxx.yaml` 末尾 `_meta` 段（由 `save_tuned_config` 写）和 `experiment_log.yaml`（由 `post_training` 写）都记录完整训练超参 + DR 配置 + 运行时环境（python/torch 版本、CLI argv 原文）。复现历史训练直接读 `_meta.runtime.cli_argv` 照抄即可。
 
 ## 备注
 

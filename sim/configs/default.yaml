@@ -68,34 +68,70 @@ dynamic_v2_vehicle:
 # 牵引车-挂车双体动力学模型（外部仓库 truckdynamicmodel）
 # 参数与 truckdynamicmodel/truck_trailer_residual_modular/constants.py BASE_MODEL_PARAMS 对齐
 truck_trailer_vehicle:
-  m_t: 9300.0          # 牵引车空载质量 (kg, xlsx R74)
-  Iz_t: 48639.0        # 牵引车横摆惯量(上游 BASE_MODEL_PARAMS,xlsx 未给)
-  L_t: 4.483           # 名义轴距 (m, xlsx R71)
-  a_t: 2.21            # 空载 CG 距前轴距离 (m,由 xlsx R76 轴荷 4712/4588 反推)
-  m_s_base: 15004.0    # 挂车基础质量 (kg)，决定 Iz_s 缩放基准
-  Iz_s_base: 96659.0   # 挂车基础横摆惯量
-  L_s: 8.0             # 挂车长度 (m)
-  c_s: 4.0             # 挂车质心到铰接点距离 (m)
-  Cf: 264000.0         # 牵引车前轴(1 轴,2 胎)空载 F_z=46.2kN 推算,见 docs/truck_vehicle_parameters.md
-  Cr: 335000.0         # 牵引车后轴组(2+3 轴共 8 胎)空载 F_z=45kN 推算
-  Cs: 80000.0          # 挂车轴侧偏刚度(无挂车模式下 trailer_mask=0 不参与计算)
-  wheel_radius: 0.5    # 车轮半径 (m)
-  track_width: 1.8
-  steering_ratio: 24.0  # 实车真值（xlsx R43 为 24.51~32 非线性，C++ vehicle_param 取 24）
-  rho: 1.225           # 空气密度
-  CdA_t: 5.82          # 牵引车 Cd × A
-  CdA_s: 6.50          # 挂车 Cd × A
-  rolling_coeff: 0.013  # 与控制器 lon_torque.coef_rolling 一致（卡车 C++ 清稿）
-  hitch_x: -0.331      # 铰接点偏移 x（牵引车体坐标系）
-  hitch_y: 0.002
+  # 参数与 plant_out/constants.py BASE_MODEL_PARAMS 严格对齐
+  # （MLP checkpoint 训练时用的就是这些值，sim 推理必须保持一致，否则
+  #  base RK4 的输出和 MLP 训练目标的 base 不在同一物理模型上，残差错位）
+  m_t: 9300.0          # 牵引车空载质量
+  Iz_t: 48639.0        # 牵引车横摆惯量
+  L_t: 4.475           # 名义轴距
+  a_t: 2.267           # 空载 CG 距前轴距离（派生 b_t = L_t - a_t = 2.208）
+  m_s_base: 0.0        # 挂车基础质量（plant_out 训练值；空载工况）
+  Iz_s_base: 96659.0
+  L_s: 8.0
+  c_s: 4.0
+  Cf: 264000.0
+  Cr: 335000.0
+  Cs: 80000.0
+  wheel_radius: 0.5
+  track_width: 1.878
+  steering_ratio: 24.0
+  rho: 1.225
+  CdA_t: 5.82
+  CdA_s: 0.0           # plant_out 训练值
+  rolling_coeff: 0.013
+  hitch_x: -0.3319
+  hitch_y: 0.0022
   min_speed_mps: 0.5
-  # 运行时挂车质量（可改为 0 切到无挂车模式，阈值 1.0 kg）
   default_trailer_mass_kg: 0.0
   # MLP 残差 checkpoint（相对 sim/ 目录）
-  checkpoint_path: configs/checkpoints/best_truck_trailer_error_model.pth
+  checkpoint_path: configs/checkpoints/best_truck_trailer_error_model_0525.pth
 
 simulation:
   dt: 0.02
+
+# 域随机化（仅 train_batch.py + truck_trailer plant 生效）
+# 启用后训练时为每个 epoch 采样 K 组车辆物理参数 (m_t, Cf, Cr)，扩展 batch
+# 维度到 48*K，让控制器看到一族 plant 上的状态轨迹。Iz_t 由 m_t 线性联动。
+# 是否启用 MLP 残差与 DR 解耦：以 truck_trailer_vehicle.checkpoint_path
+# (空串=关) 与 --disable-mlp 入参为准。注意：MLP 是按 nominal 车辆参数训练
+# 的，DR 把车辆参数推到 ±10/20% 区间时 MLP 输入分布偏离训练域，残差解释力
+# 下降——是否打开由使用方按场景权衡。
+domain_randomization:
+  enable: false       # 总开关，默认 false 走原训练路径不变
+  K: 4                # 每个 epoch 采样的 domain 数（B 从 48 扩到 48*K）
+  mt_range: 0.10      # m_t 相对 nominal 的均匀采样 ±range（0.10 = ±10%）
+  cfcr_range: 0.20    # Cf/Cr 相对 nominal 的均匀采样 ±range（0.20 = ±20%）
+
+# 状态反馈噪声（仅 train_batch.py + truck_trailer 生效；hard_mode 验证默认关）
+# 在控制器读取 vehicle 状态之前往真值上加独立高斯，模拟定位/IMU/轮速噪声。
+# 单步白噪声、每 batch 元素独立、3σ 截断。loss 仍在 vehicle 真值上算。
+feedback_noise:
+  enable: false
+  sigma_x_m: 0.02            # 位置 x 噪声 σ（合成出 lat_err σ ≈ 0.02 m）
+  sigma_y_m: 0.02            # 位置 y 噪声 σ
+  sigma_yaw_deg: 0.115       # 朝向噪声 σ（≈ 0.002 rad）
+  sigma_speed_kph: 0.18      # 车速噪声 σ（≈ 0.05 m/s）
+  sigma_yawrate_radps: 0.002 # 横摆率噪声 σ
+  clip_sigmas: 3.0
+
+# 指令高频抖动（同样 train_batch.py + truck_trailer，hard_mode 默认关）
+# 控制器算出 delta/torque 后、送进 vehicle.step 之前加高斯抖动。
+# history 仍记录控制器原始输出，loss 用真值。
+command_dither:
+  enable: false
+  sigma_delta_rad: 0.001     # 前轮转角抖动 σ（≈ 0.057°）
+  sigma_torque_nm: 15.0      # 总车轮扭矩抖动 σ
+  clip_sigmas: 3.0
 
 lat_truck:
   kLh: 0.0

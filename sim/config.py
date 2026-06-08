@@ -1,11 +1,29 @@
 # sim/config.py
 """配置文件加载器。V2: torch 表加载 + 调参结果保存。"""
 import os
+import platform as _platform
 import subprocess
+import sys
 from datetime import datetime
 
 import torch
 import yaml
+
+
+def runtime_info(include_argv: bool = False) -> dict:
+    """运行时环境快照，写进训练记录用于复现性追溯。
+
+    Args:
+        include_argv: True 时附上 sys.argv 原文（仅 __main__ 调用时有意义）。
+    """
+    info = {
+        'python': sys.version.split()[0],
+        'torch': str(torch.__version__),  # TorchVersion → str（避免 yaml 标签）
+        'platform': _platform.platform(),
+    }
+    if include_argv:
+        info['cli_argv'] = ' '.join(sys.argv)
+    return info
 
 
 def load_config(path: str | None = None) -> dict:
@@ -25,6 +43,22 @@ def apply_plant_override(cfg: dict, plant: str) -> None:
         cfg['vehicle'].setdefault(
             'checkpoint_path',
             'configs/checkpoints/best_error_model_v2.pth')
+
+
+def apply_runtime_overrides(cfg: dict,
+                             trailer_mass_kg: float | None = None,
+                             disable_mlp: bool = False) -> None:
+    """运行时覆盖 plant 配置（in-place 修改 cfg）。
+
+    - trailer_mass_kg: 覆盖 truck_trailer_vehicle.default_trailer_mass_kg
+    - disable_mlp: 把 truck_trailer_vehicle.checkpoint_path 置空，使
+      vehicle factory 跳过 MLP 残差加载，等价于纯机理 base 模式
+    """
+    if trailer_mass_kg is not None and 'truck_trailer_vehicle' in cfg:
+        cfg['truck_trailer_vehicle']['default_trailer_mass_kg'] = float(
+            trailer_mass_kg)
+    if disable_mlp and 'truck_trailer_vehicle' in cfg:
+        cfg['truck_trailer_vehicle']['checkpoint_path'] = ''
 
 
 def table_from_config(entries: list[list[float]]) -> tuple[torch.Tensor, torch.Tensor]:

@@ -9,6 +9,7 @@ train() 运行多轨迹多 epoch 梯度优化。
     python train.py --epochs 5 --trajectories circle --speed 5.0
 """
 import argparse
+import copy
 import sys
 import os
 import torch
@@ -16,7 +17,8 @@ import torch.nn as nn
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from config import load_config, save_tuned_config, apply_plant_override
+from config import (apply_plant_override, load_config, runtime_info,
+                    save_tuned_config)
 from controller.lat_truck import LatControllerTruck
 from controller.lon import LonController
 from model.trajectory import (expand_trajectories, TRAJECTORY_TYPES,
@@ -32,12 +34,15 @@ class DiffControllerParams(nn.Module):
         if cfg is None:
             cfg = load_config()
         self.cfg = cfg
+        # 深拷贝训练时实际输入的 cfg 当导出模板，保证 warm-start 场景下
+        # 非控制器字段（vehicle/plant/MLP/simulation 等）跟训练环境一致
+        self._template_cfg = copy.deepcopy(cfg)
         self.lat_ctrl = LatControllerTruck(cfg, differentiable=True)
         self.lon_ctrl = LonController(cfg, differentiable=True)
 
     def to_config_dict(self):
-        """将当前参数导出为 YAML 兼容的 dict（结构与 default.yaml 一致）。"""
-        cfg = load_config()  # 模板
+        """将当前参数导出为 YAML 兼容的 dict（模板=训练时输入的 cfg）。"""
+        cfg = copy.deepcopy(self._template_cfg)
 
         # --- 横向控制器参数 ---
         lat = cfg['lat_truck']
@@ -393,17 +398,24 @@ def train(trajectories=None, n_epochs=100, lr=5e-2, lr_tables=5e-2,
         'final_loss': losses[-1],
         'initial_loss': losses[0],
         'epochs': n_epochs,
+        'plant': plant,
+        'config_path': config_path,
         'trajectory_types': type_names,
         'trajectory_count': len(traj_list),
         'speed_bands_kph': SPEED_BANDS_KPH,
+        'sim_length': sim_length,
         'lr': lr,
         'lr_tables': lr_tables,
         'tbptt_k': tbptt_k,
         'grad_clip': grad_clip,
+        'param_snapshot_interval': param_snapshot_interval,
         'w_lat': w_lat,
         'w_head': w_head,
         'w_speed': w_speed,
+        'w_steer_rate': w_steer_rate,
+        'w_acc_rate': w_acc_rate,
         'total_time_s': round(total_time, 1),
+        'runtime': runtime_info(),
     })
     if verbose:
         print(f"参数已保存: {saved_path}")
@@ -486,9 +498,15 @@ if __name__ == '__main__':
         'tbptt_k': args.tbptt_k,
         'grad_clip': args.grad_clip,
         'plant': args.plant,
+        'config_path': args.config,
+        'snapshot_interval': args.snapshot_interval,
         'w_lat': args.w_lat,
         'w_head': args.w_head,
         'w_speed': args.w_speed,
+        'w_steer_rate': args.w_steer_rate,
+        'w_acc_rate': args.w_acc_rate,
+        'runtime': runtime_info(include_argv=True),
     }
     run_post_training(result, hyperparams, plant=args.plant,
-                      trajectory_types=args.trajectories)
+                      trajectory_types=args.trajectories,
+                      baseline_config_path=args.config)

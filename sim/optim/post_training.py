@@ -2,6 +2,7 @@
 """训练后自动化：生成 loss 曲线、对比图、实验日志。"""
 import math
 import os
+import re
 import shutil
 import sys
 from datetime import datetime
@@ -15,7 +16,8 @@ import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from config import load_config, _get_commit_hash, _tensor_to_python, apply_plant_override
+from config import (load_config, _get_commit_hash, _tensor_to_python,
+                    apply_plant_override, apply_runtime_overrides)
 from model.trajectory import (expand_trajectories, generate_park_route,
                               TRAJECTORY_TYPES, SPEED_BANDS_KPH)
 from sim_loop import run_simulation
@@ -27,6 +29,50 @@ plt.rcParams['axes.unicode_minus'] = False
 def _ensure_dir(path):
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def _build_run_tags(hyperparams: dict) -> str:
+    """根据 hyperparams 里 *已解析* 的字段生成训练产物文件夹后缀。
+
+    规则：
+      - MLP 标签：从 mlp_checkpoint 文件名末尾的数字串提取（如 0509）；空 → nomlp
+      - 域随机化标签：dr/noise/dither 任一 enable=True 时按顺序 + 串联
+      - 整体格式 'mlp{id}[_dr+noise+dither]' 或 'nomlp[_...]'
+
+    所有判定基于 hyperparams 中已解析的字段（cfg+CLI 合并后），不查 raw CLI args。
+    """
+    parts = []
+    ckpt = (hyperparams.get('mlp_checkpoint') or '').strip()
+    if ckpt:
+        base = os.path.splitext(os.path.basename(ckpt))[0]
+        m = re.search(r'_(\d{3,})$', base)
+        if m:
+            parts.append(f'mlp{m.group(1)}')
+        else:
+            short = (base
+                     .replace('best_truck_trailer_error_model_', '')
+                     .replace('best_error_model_', '')
+                     .replace('best_truck_trailer_error_model', '')
+                     .replace('best_error_model', '')
+                     .strip('_'))
+            parts.append(f'mlp{short}' if short else 'mlp')
+    else:
+        parts.append('nomlp')
+
+    rand_tags = []
+    dr = hyperparams.get('domain_randomization') or {}
+    noise = hyperparams.get('feedback_noise') or {}
+    dither = hyperparams.get('command_dither') or {}
+    if dr.get('enable'):
+        rand_tags.append('dr')
+    if noise.get('enable'):
+        rand_tags.append('noise')
+    if dither.get('enable'):
+        rand_tags.append('dither')
+    if rand_tags:
+        parts.append('+'.join(rand_tags))
+
+    return '_'.join(parts)
 
 
 def plot_loss_curves(training_history, output_dir):
@@ -155,7 +201,8 @@ def get_scenario_keys(trajectory_types=None):
 
 
 def run_comparison(tuned_config_path, output_dir, verbose=True, plant=None,
-                   trajectory_types=None, use_batched=False):
+                   trajectory_types=None, use_batched=False,
+                   baseline_config_path=None, disable_mlp: bool = False):
     """用 V1 路径跑 baseline vs tuned 对比，生成对比图 + 返回指标。
 
     Args:
@@ -167,15 +214,27 @@ def run_comparison(tuned_config_path, output_dir, verbose=True, plant=None,
         use_batched: True 时用 `run_simulation_batch(hard_mode=True)` 并行一次
                      跑完所有 49 场景（仅 truck_trailer plant），总耗时 ~6 min；
                      False 走 scalar per-scene 循环，~10 min。数值精度等价。
+        baseline_config_path: 对比基准的配置文件路径，None 走 default.yaml；
+                              warm-start 训练后透传训练输入 yaml，可让"调参前"
+                              那一栏使用训练起点而非 default
+        disable_mlp: True 时把 baseline / tuned 两份 cfg 的
+                     truck_trailer_vehicle.checkpoint_path 同时置空，
+                     baseline 和 tuned 都走纯机理 base 验证（DR 训练
+                     场景必须开启，避免对照组带 MLP 而 tuned 不带）
 
     Returns:
         comparison_metrics: {scenario_key: {baseline, tuned, delta_lat_pct, delta_head_pct}}
     """
-    cfg_base = load_config()
+    cfg_base = load_config(baseline_config_path)
     cfg_tuned = load_config(tuned_config_path)
     if plant:
         apply_plant_override(cfg_base, plant)
         apply_plant_override(cfg_tuned, plant)
+    if disable_mlp:
+        apply_runtime_overrides(cfg_base, disable_mlp=True)
+        apply_runtime_overrides(cfg_tuned, disable_mlp=True)
+        if verbose:
+            print("V1 对比 MLP 已关闭：baseline / tuned 均走纯机理 base")
 
     eval_scenarios = _build_eval_scenarios(trajectory_types)
 
@@ -744,7 +803,8 @@ def plot_parameter_changes(train_result, output_dir):
 
 
 def run_validation(tuned_config_path, output_dir=None, verbose=True,
-                    plant=None, trajectory_types=None, use_batched=False):
+                    plant=None, trajectory_types=None, use_batched=False,
+                    baseline_config_path=None, disable_mlp: bool = False):
     """独立验证入口：仅跑 V1 对比 + 生成对比图，不需要 train_result。
 
     Args:
@@ -754,6 +814,7 @@ def run_validation(tuned_config_path, output_dir=None, verbose=True,
         plant: 被控对象类型，None 使用配置默认值
         trajectory_types: 轨迹类型名列表，None 则全量验证
         use_batched: True 走并行 batched（仅 truck_trailer），False 走 scalar per-scene
+        baseline_config_path: 对比基准的配置文件路径，None 走 default.yaml
 
     Returns:
         output_dir: 产物保存目录路径
@@ -779,7 +840,9 @@ def run_validation(tuned_config_path, output_dir=None, verbose=True,
 
     comparison_metrics, scenario_labels = run_comparison(
         tuned_config_path, output_dir, verbose=verbose, plant=plant,
-        trajectory_types=trajectory_types, use_batched=use_batched)
+        trajectory_types=trajectory_types, use_batched=use_batched,
+        baseline_config_path=baseline_config_path,
+        disable_mlp=disable_mlp)
 
     # 复制 tuned config 到产物目录
     shutil.copy2(tuned_config_path,
@@ -806,7 +869,9 @@ def run_validation(tuned_config_path, output_dir=None, verbose=True,
 
 
 def run_post_training(train_result, hyperparams, verbose=True, plant=None,
-                      trajectory_types=None, use_batched=False):
+                      trajectory_types=None, use_batched=False,
+                      baseline_config_path=None,
+                      disable_mlp: bool = False):
     """训练后一站式自动化入口。
 
     Args:
@@ -815,15 +880,22 @@ def run_post_training(train_result, hyperparams, verbose=True, plant=None,
         verbose: 是否打印进度
         plant: 被控对象类型 ('kinematic'/'dynamic')，None 使用配置默认值
         trajectory_types: 验证用轨迹类型，None 则全量
+        baseline_config_path: 对比基准的配置文件路径，None 走 default.yaml；
+                              warm-start 训练时透传训练输入 yaml，让验证里的"调参前"
+                              对照组与训练起点匹配，Δ% 反映本轮训练增量
+        disable_mlp: True 时把 baseline 与 tuned 的 cfg.checkpoint_path 同时
+                     置空（DR 训练后必须开启，验证才能反映"无 MLP"工况）
 
     Returns:
         output_dir: 产物保存目录路径
     """
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    tags = _build_run_tags(hyperparams)
+    folder_name = f"{timestamp}_{tags}" if tags else timestamp
     sim_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
     plant_name = plant or 'kinematic'
     output_dir = _ensure_dir(os.path.join(sim_dir, 'results', 'training',
-                                          plant_name, timestamp))
+                                          plant_name, folder_name))
 
     if verbose:
         print(f"\n{'='*60}")
@@ -846,7 +918,9 @@ def run_post_training(train_result, hyperparams, verbose=True, plant=None,
         print(f"\n  --- V1 路径验证（baseline vs tuned）---")
     comparison_metrics, scenario_labels = run_comparison(
         train_result['saved_path'], output_dir, verbose=verbose, plant=plant,
-        trajectory_types=trajectory_types, use_batched=use_batched)
+        trajectory_types=trajectory_types, use_batched=use_batched,
+        baseline_config_path=baseline_config_path,
+        disable_mlp=disable_mlp)
 
     # 4. 训练摘要仪表板
     p = plot_training_summary(train_result, comparison_metrics, hyperparams, output_dir,
@@ -895,8 +969,16 @@ if __name__ == '__main__':
                         help='输出目录，默认 results/validation/{plant}/{timestamp}/')
     parser.add_argument('--batched', action='store_true',
                         help='用并行批量路径跑 V1（仅 truck_trailer），~6 min vs scalar ~10 min')
+    parser.add_argument('--baseline-config', default=None,
+                        help='对比基准的配置文件路径，默认 default.yaml；'
+                             '想跟某份 tuned 起点对比时显式指定该路径')
+    parser.add_argument('--disable-mlp', action='store_true',
+                        help='验证全程关 MLP（baseline / tuned 都把 cfg '
+                             'checkpoint_path 置空，走纯机理 base）')
     args = parser.parse_args()
 
     run_validation(args.config, output_dir=args.output_dir, plant=args.plant,
                    trajectory_types=args.trajectories,
-                   use_batched=args.batched)
+                   use_batched=args.batched,
+                   baseline_config_path=args.baseline_config,
+                   disable_mlp=args.disable_mlp)

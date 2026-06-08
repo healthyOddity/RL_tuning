@@ -67,6 +67,29 @@ class TruckTrailerNominalDynamics(nn.Module):
         self.register_buffer("_eps", torch.tensor(1.0e-8))
         self.no_trailer_mass_threshold_kg = NO_TRAILER_MASS_THRESHOLD_KG
 
+        # 域随机化用的 nominal 备份（不参与运算，仅供 set_domain 联动 Iz_t）
+        self.register_buffer("_m_t_nominal", torch.tensor(float(params["m_t"])))
+        self.register_buffer("_Iz_t_nominal", torch.tensor(float(params["Iz_t"])))
+
+    def set_domain(self, m_t: torch.Tensor, Cf: torch.Tensor, Cr: torch.Tensor) -> None:
+        """运行时注入域随机化参数。
+
+        m_t / Cf / Cr 必须同 shape（0-d 或 [B]）。Iz_t 由 m_t 与 nominal
+        值线性联动算出：Iz_t = Iz_t_nominal * (m_t / m_t_nominal)，避免
+        “轻车却惯量大”这种不物理 domain。
+
+        所有底层动力学算式（轮胎力、横摆、阻力）天然 element-wise，[B]
+        参数会自动广播到 state shape [B, state_dim]。
+        """
+        m_t = torch.as_tensor(m_t, dtype=self.m_t.dtype, device=self.m_t.device)
+        Cf = torch.as_tensor(Cf, dtype=self.Cf.dtype, device=self.Cf.device)
+        Cr = torch.as_tensor(Cr, dtype=self.Cr.dtype, device=self.Cr.device)
+        Iz_t = self._Iz_t_nominal * (m_t / self._m_t_nominal)
+        self.m_t = m_t
+        self.Iz_t = Iz_t
+        self.Cf = Cf
+        self.Cr = Cr
+
     def _signed_safe_velocity(self, velocity: torch.Tensor) -> torch.Tensor:
         sign = torch.where(velocity >= 0.0, 1.0, -1.0).to(dtype=velocity.dtype, device=velocity.device)
         return sign * torch.clamp(torch.abs(velocity), min=float(self.min_speed_mps.item()))
@@ -233,7 +256,7 @@ class TruckTrailerNominalDynamics(nn.Module):
 
 
 # ===== MLP 残差网络（来自 model_structure.py）=====
-# 结构：input → [Linear → (LayerNorm) → Tanh → Dropout] × hidden_layers → Linear → output
+# 结构：input → [Linear → (LayerNorm) → LeakyReLU(0.02) → Dropout] × hidden_layers → Linear → output
 # 向后兼容默认 hidden_dim=128, hidden_layers=4（老 checkpoint）；
 # 新 checkpoint 带 mlp_hidden_dim / mlp_hidden_layers 时走配置值（如 64/3）。
 
@@ -252,7 +275,7 @@ class MLPErrorModel(nn.Module):
         for _ in range(self.hidden_layers):
             layers.append(nn.Linear(prev_dim, self.hidden_dim))
             layers.append(self._build_norm(self.hidden_dim))
-            layers.append(nn.Tanh())
+            layers.append(nn.LeakyReLU(negative_slope=0.02))
             layers.append(nn.Dropout(safe_dropout))
             prev_dim = self.hidden_dim
         layers.append(nn.Linear(prev_dim, output_dim))

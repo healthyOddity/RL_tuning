@@ -101,9 +101,11 @@
 │   │   └── checkpoints/                #     MLP 权重文件 (.pth)
 │   │
 │   ├── results/
-│   │   └── baseline/                   #     基线结果图（按被控对象分目录）
+│   │   ├── baseline/                   #     基线结果图（按被控对象分目录）
+│   │   └── diagnostic/                 #     调研产物（如 mlp_instability/<ckpt>/ 下 MLP 失控诊断全套图）
 │   │
-│   ├── tests/                          #     pytest 测试（158 用例）
+│   ├── debug/                          #   常态化调研脚本（含 MLP 失控诊断套件 run_for_ckpt.py）+ 一次性排查
+│   ├── tests/                          #     pytest 测试（170 用例，含 12 项域随机化）
 │   └── learn/                          #     学习笔记
 │
 ├── docs/                               # 设计文档
@@ -139,7 +141,7 @@ cd sim
 python -m pytest tests/ -q
 ```
 
-预期：`158 passed`。如有 FAILED 先解决环境问题再往后走。
+预期：约 `189 passed`。如有 FAILED 先解决环境问题再往后走。
 
 ### 第 3 步：跑可视化 Demo 看基线效果（约 1-2 分钟）
 
@@ -151,7 +153,7 @@ python run_demo.py --plant truck_trailer --save --no-show
 
 ### 第 4 步：跑可微调参训练
 
-**truck_trailer 强烈推荐 `train_batch.py`**（49 场景每时间步同步推进的 batched 并行训练），比 scalar 版 `train.py` 快 8× 左右。
+**truck_trailer 强烈推荐 `train_batch.py`**（48 场景每时间步同步推进的 batched 并行训练），比 scalar 版 `train.py` 快 8× 左右。
 
 ```bash
 # 推荐路径：batched 并行（truck_trailer 专用）
@@ -169,6 +171,7 @@ python optim/train.py --epochs 6 --plant kinematic
 
 **时间预估**：
 - `train_batch.py` + truck_trailer: 单 epoch ~5 min，6 epoch + post_training 验证约 **35-40 分钟**
+- `train_batch.py` + truck_trailer + `--dr-enable`（K=4）: 单 epoch ~8 min，6 epoch + 验证约 **50 分钟**
 - `train.py` scalar（kinematic/dynamic 等非卡车 plant）: 单 epoch ~40 min，6 epoch 全量 **2-4 小时**
 
 想先快速验证流程：加 `--trajectories lane_change --sim-length 60`，1-2 分钟跑完。
@@ -183,7 +186,7 @@ python optim/train.py --epochs 6 --plant kinematic
 | `comparison_*.png` | 49 场景 baseline vs tuned 轨迹/误差对比 |
 | `parameter_changes.png` | 每个可微参数训练前后的变化热力图 |
 | `training_summary.png` | 全场景 lat_rmse/head_rmse 汇总仪表板 |
-| `experiment_log.yaml` | 完整实验日志（超参、最终参数、各场景指标）|
+| `experiment_log.yaml` | 完整实验日志（超参、最终参数、各场景指标、运行时环境快照含 Python/PyTorch 版本和完整 CLI argv）|
 
 调好的参数存在 `sim/configs/tuned/tuned_{commit}_{时间戳}.yaml`，可以再做独立验证：
 
@@ -222,6 +225,8 @@ python optim/validate_batch.py \
 
 ## 训练 CLI 参数
 
+通用参数（`train.py` 与 `train_batch.py` 共有）：
+
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--plant` | 读 yaml（默认 kinematic）| 被控对象；推荐 `truck_trailer`（见下方「车辆模型」） |
@@ -232,10 +237,67 @@ python optim/validate_batch.py \
 | `--lr-tables` | 5e-2 | 查找表 y 值学习率 |
 | `--tbptt-k` | 150 | TBPTT 截断窗口（步数，150 步 = 3 秒） |
 | `--grad-clip` | 10.0 | 梯度范数裁剪阈值 |
-| `--sim-length` | None | 仿真距离限制 (m)，None 为全长 |
+| `--sim-length` | None | 仿真距离限制 (m)，None 为全长（仅 `train.py`）|
 | `--w-lat` | 10.0 | 横向误差 loss 权重 |
 | `--w-head` | 8.0 | 航向误差 loss 权重 |
 | `--w-speed` | 3.0 | 速度误差 loss 权重 |
+| `--w-steer-rate` | 0.05 | 转向角变化率正则权重 |
+| `--w-acc-rate` | 0.01 | 加速度变化率正则权重 |
+| `--snapshot-interval` | 10 | 参数快照间隔（epoch） |
+
+`train_batch.py` 专属（truck_trailer 并行 + 域随机化 + MLP 开关）：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--scalar-validation` | False | post_training V1 验证退回 scalar 路径 |
+| `--no-post-training` | False | 跳过训练后自动验证 |
+| `--disable-mlp` | False | 训练 + 验证全程关 MLP（`checkpoint_path` 置空，纯机理 base） |
+| `--dr-enable` | None（cfg）| 启用域随机化（覆盖 yaml；与 `--disable-mlp` 解耦） |
+| `--dr-K` | None（cfg=4）| 每 epoch 采样的 domain 数（B 从 48 扩到 48×K） |
+| `--dr-mt-range` | None（cfg=0.10）| 牵引车质量 m_t 相对 nominal 的 ±range |
+| `--dr-cfcr-range` | None（cfg=0.20）| 前/后轴侧偏刚度 Cf/Cr 相对 nominal 的 ±range |
+| `--dr-seed` | None | DR 采样随机种子（None 不固定，传整数复现） |
+| `--noise-enable` / `--no-noise` | None（cfg）| 状态反馈高斯白噪声开关（5 通道：x/y/yaw/speed/yawrate） |
+| `--sigma-x / --sigma-y / --sigma-yaw / --sigma-speed / --sigma-yawrate` | None（cfg）| 状态噪声各通道 σ 一次性覆盖 |
+| `--dither-enable` / `--no-dither` | None（cfg）| 指令高频抖动开关（delta + torque） |
+| `--sigma-delta / --sigma-torque` | None（cfg）| 抖动各通道 σ 一次性覆盖 |
+| `--noise-seed` | None | 噪声 + 抖动共用的随机种子（与 `--dr-seed` 解耦） |
+
+## 域随机化（Domain Randomization，`train_batch.py` + `truck_trailer`）
+
+为了让控制器对车辆物理参数不确定性鲁棒，训练时在车辆质量和前后轴侧偏刚度上加随机扰动。每个 epoch 开头采样 K 组 `(m_t, Cf, Cr)`，把 48 条标准轨迹复制 K 份分别绑到 K 个域上，让控制器一次更新就照顾到 K 种"不同的车"。`Iz_t` 跟随 `m_t` 线性缩放，保持物理一致性。
+
+```bash
+# 标准 DR 训练命令（K=4 默认值，6 epoch 约 50 分钟）
+python optim/train_batch.py --plant truck_trailer --dr-enable --dr-seed 2026 --epochs 6
+
+# 不带 MLP 的纯机理 DR 训练（避开 MLP 输入分布偏移训练域的问题）
+python optim/train_batch.py --plant truck_trailer --dr-enable --disable-mlp --epochs 6
+
+# 加大随机化范围（m_t ±20%、Cf/Cr ±30%）
+python optim/train_batch.py --plant truck_trailer --dr-enable \
+  --dr-mt-range 0.20 --dr-cfcr-range 0.30 --dr-K 8 --epochs 6
+```
+
+**默认范围（`default.yaml` 的 `domain_randomization` 段）**：m_t ±10%、Cf/Cr ±20%，K=4。每个参数独立均匀采样后凑成 K 个三元组，没有"同加同减"的相关性。
+
+**MLP 开关与 DR 正交**：是否启用 MLP 残差仅由 `truck_trailer_vehicle.checkpoint_path`（空串=关）和 `--disable-mlp` 决定。MLP 按 nominal 车辆参数训练，DR 大幅扰动参数时输入分布偏离训练域；是否打开 MLP 由使用方按场景权衡，代码不强制。
+
+详细设计与 2026-05-08 首跑结果（loss -42.3%、49 场景 47/49 改善 25-48%）见 [`docs/plans/2026-05-08-domain-randomization-design.md`](docs/plans/2026-05-08-domain-randomization-design.md)。
+
+### 激进 DR：状态噪声 + 指令抖动
+
+在物理参数 DR 之上叠加两类感知/执行扰动：控制器读取 vehicle 状态之前往真值上加 5 通道（x/y/yaw/speed/yawrate）独立高斯，控制器算出 `delta/torque` 后送 plant 之前再加 2 通道高斯抖动。两者均为单步白噪声、3σ 截断、`--noise-seed` 锁种子。`hard_mode=True` 验证路径强制 mute——V1 49 场景对比仍然干净。
+
+```bash
+# 激进 DR：物理 + 状态噪声 + 指令抖动叠加（中档 σ，6 epoch ~50 min）
+python optim/train_batch.py --plant truck_trailer \
+  --dr-enable --dr-seed 2026 \
+  --noise-enable --dither-enable --noise-seed 2026 \
+  --epochs 6
+```
+
+设计与实施计划见 [`docs/plans/2026-05-08-aggressive-dr-noise-dither-design.md`](docs/plans/2026-05-08-aggressive-dr-noise-dither-design.md) / [`docs/plans/2026-05-08-aggressive-dr-noise-dither-plan.md`](docs/plans/2026-05-08-aggressive-dr-noise-dither-plan.md)。
 
 ## 车辆模型（被控对象）
 
@@ -304,7 +366,7 @@ MLP 的网络结构（层数、激活函数、输入特征、归一化参数）�
 `truck_trailer` 是牵引车+挂车双体动力学。底层模型（`TruckTrailerNominalDynamics` + `MLPErrorModel`）和 MLP checkpoint 都已**本地化**在本仓库，无需外部依赖：
 
 - 动力学代码：`sim/model/truck_trailer_dynamics.py`（来自 [`mutespeaker/truckdynamicmodel`](https://github.com/mutespeaker/truckdynamicmodel) 上游 `base_model.py + model_structure.py` 的拷贝）
-- MLP 权重：`sim/configs/checkpoints/truck_trailer_error_model.pth`
+- MLP 权重：放在 `sim/configs/checkpoints/` 下，由 yaml 的 `truck_trailer_vehicle.checkpoint_path` 字段指定具体文件（见下方配置示例；置空或删除该字段则不加 MLP，只用纯 base 动力学）
 
 ```yaml
 vehicle:
@@ -313,8 +375,8 @@ vehicle:
 truck_trailer_vehicle:
   # 车辆物理参数（按 L4 电拖头首台车实车标定校准）
   m_t: 9300.0          # 牵引车空载质量 (kg)
-  L_t: 4.475           # 名义轴距 (m)
-  a_t: 3.8             # 前轴到质心距离 (m，满载/带挂工况)
+  L_t: 4.483           # 名义轴距 (m，xlsx R71)
+  a_t: 2.21            # 空载 CG 距前轴距离 (m，由 xlsx R76 轴荷反推)
   m_s_base: 15004.0    # 挂车基础质量 (kg)
   L_s: 8.0             # 挂车长度 (m)
   c_s: 4.0             # 挂车质心到铰接点距离 (m)
@@ -330,7 +392,7 @@ truck_trailer_vehicle:
   rolling_coeff: 0.013 # 滚阻系数（与 lon_torque.coef_rolling 一致）
   # ... 其他铰接点偏移等
   default_trailer_mass_kg: 0.0   # 默认无挂车（改为 15000 切到带挂模式）
-  checkpoint_path: configs/checkpoints/best_truck_trailer_error_model.pth  # MLP 残差权重
+  checkpoint_path: configs/checkpoints/best_truck_trailer_error_model_0525.pth  # 当前默认 MLP 残差权重；置空/删行则不加 MLP
 ```
 
 **关键事实：**
@@ -339,14 +401,14 @@ truck_trailer_vehicle:
 - 挂车质量可通过 yaml 切换（`< 1.0 kg` 自动进入无挂车模式，默认 `0` 即单机）
 - **物理参数和 MLP checkpoint 是耦合的**：MLP 学的是"特定 base 参数下 + CarSim 真值"的残差，改 Cf/Cr/steering_ratio 等 base 参数后 MLP 可能失配，需重新训练 checkpoint
 - 上游若有更新，需手动同步 `truck_trailer_dynamics.py`（文件头标注了上游版本）
-- 侧偏刚度推算依据 + xlsx 完整参数表见 [`docs/truck_vehicle_parameters.md`](docs/truck_vehicle_parameters.md)
+- xlsx 完整参数提取见 [`docs/truck_vehicle_parameters.md`](docs/truck_vehicle_parameters.md);Cf/Cr 推算见 [`docs/cornering_stiffness_derivation.md`](docs/cornering_stiffness_derivation.md);a_t 推算见 [`docs/cg_position_derivation.md`](docs/cg_position_derivation.md)
 
 ### 新增被控对象
 
 | 场景 | 操作 |
 |------|------|
-| 更换 MLP checkpoint（同 base 模型） | 替换 `.pth` 文件 + 改 yaml 中 `checkpoint_path`，**零代码改动** |
-| MLP 结构变化（层数/激活函数/输入特征） | 同上，**零代码改动**（结构从 checkpoint 自动重建） |
+| 更换 MLP checkpoint（同 base 模型、同网络结构） | 替换 `.pth` 文件 + 改 yaml 中 `checkpoint_path` |
+| MLP 结构变化（层数/激活函数/输入特征） | 同步更新 `truck_trailer_dynamics.py` 的网络实现；当前 0525 权重使用 `LeakyReLU(0.02)` |
 | 新 base 动力学模型 | 1. 在 `sim/model/` 下写新的 `nn.Module`（实现 `forward(state, control, dt) → next_state`） 2. 在 `vehicle_factory.py` 的 `_BASE_MODEL_REGISTRY` 注册 3. 在 `default.yaml` 添加物理参数段 |
 
 > **前后轴约定**：所有被控对象的 `x`、`y` 属性必须输出**后轴坐标**。内部动力学可使用任意参考点（前轴/质心），坐标转换在 vehicle 内部完成。
@@ -379,7 +441,9 @@ truck_trailer_vehicle:
 |--------|------|
 | `park_route` | 园区综合路线（仅验证时使用） |
 
-## 独立验证
+## 独立验证 / A/B 对比 / Demo CLI
+
+### post_training.py — tuned vs baseline 独立验证
 
 ```bash
 cd sim
@@ -387,19 +451,158 @@ cd sim
 # 全量验证（49 场景 = 8 类型 × 6 速度段 + park_route）
 python optim/post_training.py --config configs/tuned/xxx.yaml --plant truck_trailer
 
+# truck_trailer 走 batched 并行（~6 min vs scalar ~10 min）
+python optim/post_training.py --config configs/tuned/xxx.yaml --plant truck_trailer --batched
+
 # 指定类型验证
 python optim/post_training.py --config configs/tuned/xxx.yaml --trajectories lane_change clothoid_decel
 
-# 验证输出：5 种对比图 + 训练摘要仪表板 + 实验日志
+# 自定义对比基线（默认 default.yaml；用于 tuned A vs tuned B）
+python optim/post_training.py --config configs/tuned/v2.yaml --baseline-config configs/tuned/v1.yaml
+
+# baseline 和 tuned 都关 MLP（验证纯机理表现）
+python optim/post_training.py --config configs/tuned/xxx.yaml --disable-mlp --plant truck_trailer
 ```
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--config` | （必填）| tuned 配置文件路径 |
+| `--baseline-config` | default.yaml | 对比基线 yaml 路径（换成 tuned 即可做 tuned A vs tuned B） |
+| `--plant` | yaml 中的值 | 被控对象（kinematic / dynamic / hybrid_dynamic / hybrid_v2 / truck_trailer） |
+| `--trajectories` | 全量 49 场景 | 轨迹子集，自动展开到 6 速度段 + park_route |
+| `--batched` | False | 走 batched 并行 V1 路径（仅 truck_trailer） |
+| `--disable-mlp` | False | baseline 和 tuned 同时置空 `checkpoint_path`，比纯 base 动力学 |
+| `--output-dir` | results/validation/{plant}/{ts}/ | 自定义输出目录 |
+
+输出：5 种 baseline vs tuned 对比图（轨迹/横向误差/航向误差/转向角/加速度）+ 训练摘要仪表板 + `experiment_log.yaml`。
+
+### validate_batch.py — 自定义 A/B 并行对比（仅 truck_trailer）
+
+```bash
+# 例 1：有 MLP vs 无 MLP（同一 yaml，A 关 MLP）
+python optim/validate_batch.py \
+  --config-a configs/default.yaml --label-a "仅机理" \
+  --config-b configs/default.yaml --label-b "机理+MLP" \
+  --disable-mlp-a --plant truck_trailer
+
+# 例 2：不同 tuned yaml 对比
+python optim/validate_batch.py \
+  --config-a configs/tuned/v1.yaml --label-a "v1" \
+  --config-b configs/tuned/v2.yaml --label-b "v2" \
+  --plant truck_trailer
+
+# 例 3：不同挂车质量（空载 vs 满载 15 t）
+python optim/validate_batch.py \
+  --config-a configs/default.yaml --label-a "空载" \
+  --config-b configs/default.yaml --label-b "满载15t" \
+  --trailer-mass-a 0 --trailer-mass-b 15000 --plant truck_trailer
+
+# 例 4：传统 baseline vs tuned 模式（仅传 --config，A=default.yaml）
+python optim/validate_batch.py --config configs/tuned/xxx.yaml --plant truck_trailer
+```
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--config` | None | 传统模式：A=default.yaml、B=此参数指定的 tuned yaml |
+| `--config-a` / `--config-b` | None | A/B 模式：分别指定两份 yaml |
+| `--label-a` / `--label-b` | None | 图例标签 |
+| `--title-prefix` | "" | 图表标题前缀 |
+| `--plant` | yaml 中的值 | 仅支持 `truck_trailer` |
+| `--trailer-mass-a` / `--trailer-mass-b` | None | A/B 各自覆盖 yaml 的挂车质量 (kg) |
+| `--disable-mlp-a` / `--disable-mlp-b` | False | A/B 各自把 `checkpoint_path` 置空，关 MLP 残差 |
+| `--trajectories` | 全量 49 场景 | 轨迹子集 |
+| `--output-dir` | results/validation/truck_trailer/<ts>_batch | 自定义输出目录 |
+| `--output-suffix` | "" | 加在默认输出目录末尾的后缀 |
+
+### run_demo.py — 可视化 Demo
+
+```bash
+# 默认 plant（kinematic），弹窗显示
+python run_demo.py
+
+# truck_trailer 跑 8 个标准场景并保存 PNG（不弹窗）
+python run_demo.py --plant truck_trailer --save --no-show
+
+# 加载调参结果，看调完后的跟踪效果
+python run_demo.py --plant truck_trailer --config configs/tuned/xxx.yaml --save --no-show
+```
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--plant` | yaml 中的值 | 被控对象（同 train.py 的 5 选项） |
+| `--config` | default.yaml | 加载指定 yaml（用 tuned yaml 看调参后的效果） |
+| `--save` | False | 保存 PNG 到 `sim/results/baseline/{plant}/` |
+| `--no-show` | False | 不弹窗（配合 `--save` 批跑用） |
+
+## MLP 残差诊断套件
+
+**用途**：当某个 `truck_trailer` MLP checkpoint 上线后跟参考轨迹南辕北辙、或出现折返、或闭环 RMSE 比纯机理 base 还差时，用这套工具一键定位是哪个输出维度（vx_t / vy_t / r_t / 相对位姿残差）在闭环里把控制器拽爆，以及 MLP 在什么样的输入分布下会输出失控。
+
+**一键跑一个 ckpt**：
+
+```bash
+python sim/debug/run_for_ckpt.py \
+    --subdir 0508_train_loss \
+    --test-ckpt configs/checkpoints/best_truck_trailer_error_model_train_loss_0508.pth \
+    --test-label 0508TL
+```
+
+| 参数 | 说明 |
+|---|---|
+| `--subdir` | 输出子目录名（落到 `sim/results/diagnostic/mlp_instability/<subdir>/`） |
+| `--test-ckpt` | 被测 MLP 的 .pth 路径（相对 `sim/`） |
+| `--test-label` | 这个 MLP 在所有图里的标签（如 `0508TL`、`0509A` 等） |
+| `--scenarios` | 可选，过滤只跑指定场景（默认全跑 4 场景）|
+| `--skip-collect` | 仅重画图、不重新采集（npz 已存在时用） |
+
+跑完产物（约 5-10 分钟，4 场景 × 8 变体闭环 + 4 张主图）：
+
+| 文件 | 看什么 |
+|---|---|
+| `ROOT_CAUSE_STORY.png` | 一图说清根因（开环偏置 + 闭环演化 + 消融 + 偏离时序） |
+| `panel_*.png` | 单场景 9 宫格诊断（轨迹/误差/MLP 输出/OOD 距离/转向命令/消融柱状） |
+| `early_*.png` | 早期 4 秒失控时序（MLP 输出 vs 累积位置偏差，证明是积分而非单步爆炸） |
+| `cross_scenario_summary.png` | 8 变体 × 4 场景横向 RMSE 总览 + MLP 三分量输出量级 |
+| `mlp_static_vx_scan.png` | 9D 输出随车速静态扫描（最干净输入下 MLP 凭空输出多少） |
+| `danger_1d_sweeps.png` | 5 个核心输入维各自 1D 扫描，对比默认 / 0506 / 被测 MLP |
+| `danger_2d_vx_vy.png` | (vx, vy) 平面输出热图 + 闭环实际状态点 overlay |
+| `danger_2d_vy_r.png` | (vy, r) 平面输出热图（车速锁 5 kph） |
+| `danger_input_output_correlation.png` | 闭环里实际输入 vs MLP 输出散点（按时间着色） |
+
+**对比两个 ckpt**（在跑完两个的子目录后）：
+
+```bash
+python sim/debug/plot_compare_ckpts.py
+```
+
+产出 `sim/results/diagnostic/mlp_instability/0507_vs_0508TL_comparison.png`，5 行对比开环静态扫描 / 闭环 RMSE / vy_t 输出量级 / vy_t 状态时序 / 转向命令。要换对比对象时直接改脚本里 `ckpts` 列表。
+
+**复用脚本**：`run_for_ckpt.py` 通过 monkey-patch（`os.path.join` 重定向 + `Figure.savefig` 标签替换）复用 4 个绘图脚本，无需为每个 ckpt 改源码。完整证据链方法论与默认 4 场景设计见 [`docs/plans/2026-05-08-0507-mlp-instability-rootcause.md`](docs/plans/2026-05-08-0507-mlp-instability-rootcause.md)。
+
+**全场景 MLP 输出 panel**（49 条评估轨迹）：
+
+```bash
+python sim/debug/plot_mlp_outputs_all_scenarios.py \
+    --ckpt configs/checkpoints/best_truck_trailer_error_model_train_loss_0518.pth \
+    --config configs/train_with_0518.yaml \
+    --subdir 0518 --label 0518TL
+```
+
+复用 `run_simulation_batch(hard_mode=True, capture_mlp=True)`，把 49 条评估轨迹（8 类型 × 6 速度段 + park_route）同步推进 + 同步抓 MLP 输入/输出，单 ckpt 全套耗时约 3-4 min（仿真并行 ~200s + 串行画图 ~5s）。每场景一张 4×3 panel：行 1 跟踪+OOD、行 2-4 完整 9D MLP 输出（vx_t/vy_t/r_t / vx_s/vy_s/r_s / rel_x/rel_y/rel_yaw）。**只画目标 MLP，无变体对比**——适合做"上线 ckpt × 全场景"的鸟瞰，用来挑出 MLP 在哪些速度/曲率组合下输出失控。产物落到 `sim/results/diagnostic/mlp_output_panels/<subdir>/panel_<scenario_key>.png`。
 
 ## 文档
 
 - [`docs/project_overview_and_ai_workflow.md`](docs/project_overview_and_ai_workflow.md) — 项目技术总览 + AI 协作开发实录
 - [`docs/controller_spec_v2.md`](docs/controller_spec_v2.md) — 控制器完整规格（含纵向扭矩模型/坡度估计）
 - [`docs/controller_reproduction_workflow.md`](docs/controller_reproduction_workflow.md) — 新控制器可微复现的标准 5 阶段流程
-- [`docs/truck_vehicle_parameters.md`](docs/truck_vehicle_parameters.md) — L4 电拖头实车参数提取 + 侧偏刚度推算
+- [`docs/truck_vehicle_parameters.md`](docs/truck_vehicle_parameters.md) — L4 电拖头实车参数提取
+- [`docs/cornering_stiffness_derivation.md`](docs/cornering_stiffness_derivation.md) — 前后轴侧偏刚度 Cf/Cr 推算
+- [`docs/cg_position_derivation.md`](docs/cg_position_derivation.md) — 前轴到质心距离 a_t 推算
 - [`docs/tunable_params_analysis.md`](docs/tunable_params_analysis.md) — 可调参数分析
 - [`docs/bptt_gradient_explosion_analysis.md`](docs/bptt_gradient_explosion_analysis.md) — BPTT 梯度爆炸分析
 - [`docs/plans/2026-04-15-torque-output-layer-design.md`](docs/plans/2026-04-15-torque-output-layer-design.md) — 纵向扭矩输出层设计
+- [`docs/plans/2026-05-08-domain-randomization-design.md`](docs/plans/2026-05-08-domain-randomization-design.md) — 域随机化设计 + 首跑结果
+- [`docs/plans/2026-05-08-0507-mlp-instability-rootcause.md`](docs/plans/2026-05-08-0507-mlp-instability-rootcause.md) — 0507 MLP 闭环失控根因调研 + 通用诊断工具链
+- [`docs/plans/2026-05-08-aggressive-dr-noise-dither-design.md`](docs/plans/2026-05-08-aggressive-dr-noise-dither-design.md) — 激进 DR：状态噪声 + 指令抖动设计
+- [`docs/plans/2026-05-08-aggressive-dr-noise-dither-plan.md`](docs/plans/2026-05-08-aggressive-dr-noise-dither-plan.md) — 激进 DR 实施计划（8 task）
 - [`docs/plans/`](docs/plans/) — 其他设计文档与实现计划
