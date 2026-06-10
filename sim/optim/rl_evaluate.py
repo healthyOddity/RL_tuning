@@ -23,18 +23,25 @@ from stable_baselines3 import SAC
 from config import load_config, apply_plant_override
 from controller.lat_truck import LatControllerTruck
 from controller.lon import LonController
-from model.trajectory import (expand_trajectories, TRAJECTORY_TYPES,
-                              SPEED_BANDS_KPH)
+from model.trajectory import expand_trajectories
 from sim_loop import run_simulation
 from optim.rl_env import RLTuningEnv, extract_geometric_features
 from optim.train import tracking_loss
-from optim.post_training import _plot_comparison_grid, _calc_metrics
+from optim.post_training import (_plot_comparison_grid, _calc_metrics,
+                                 _build_eval_scenarios)
 
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
 
-def evaluate_rl_model(model_path, plant, dc_config_path, output_dir=None):
+def _build_rl_eval_scenarios(trajectory_types=None, include_park_route=False):
+    if include_park_route:
+        return _build_eval_scenarios(trajectory_types)
+    return expand_trajectories(trajectory_types)
+
+
+def evaluate_rl_model(model_path, plant, dc_config_path, output_dir=None,
+                      trajectory_types=None, include_park_route=False):
     model = SAC.load(model_path)
     env = RLTuningEnv(plant=plant, config_path=dc_config_path,
                        compute_baseline_losses=False)
@@ -48,8 +55,10 @@ def evaluate_rl_model(model_path, plant, dc_config_path, output_dir=None):
     results = []
     all_base = []
     all_tuned = []
-    for key in env._traj_keys_list:
-        traj = env._traj_cache[key]
+    eval_scenarios = _build_rl_eval_scenarios(
+        trajectory_types, include_park_route=include_park_route)
+    for key, label, gen in eval_scenarios:
+        traj = gen()
         traj_speed = traj[0].v
         features = extract_geometric_features(traj)
 
@@ -99,8 +108,8 @@ def evaluate_rl_model(model_path, plant, dc_config_path, output_dir=None):
 
         dc_metrics = _calc_metrics(dc_history)
         rl_metrics = _calc_metrics(rl_history)
-        all_base.append((key, key, traj, dc_history, dc_metrics, traj_speed))
-        all_tuned.append((key, key, traj, rl_history, rl_metrics, traj_speed))
+        all_base.append((key, label, traj, dc_history, dc_metrics, traj_speed))
+        all_tuned.append((key, label, traj, rl_history, rl_metrics, traj_speed))
 
         is_ood = env.is_ood(features)
         ood_label = ' [!OOD]' if is_ood else ''
@@ -179,6 +188,10 @@ if __name__ == '__main__':
                         help='DC baseline 配置路径 (YAML)')
     parser.add_argument('--plant', type=str, default='hybrid_v2',
                         help='被控对象类型')
+    parser.add_argument('--trajectories', nargs='+', default=None,
+                        help='轨迹类型名，默认全量 48 条标准轨迹')
+    parser.add_argument('--include-park-route', action='store_true',
+                        help='追加 DC V1 验证中的 park_route，评估 48+1 场景')
     parser.add_argument('--output', type=str, default=None,
                         help='输出目录')
     args = parser.parse_args()
@@ -193,4 +206,6 @@ if __name__ == '__main__':
         plant=args.plant,
         dc_config_path=args.dc_config,
         output_dir=output_dir,
+        trajectory_types=args.trajectories,
+        include_park_route=args.include_park_route,
     )

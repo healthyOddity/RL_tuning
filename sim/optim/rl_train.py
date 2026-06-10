@@ -7,6 +7,7 @@
     python optim/rl_train.py --plant hybrid_v2 --config configs/tuned/xxx.yaml --total-timesteps 50000
 """
 import argparse
+import glob
 import os
 import sys
 from datetime import datetime
@@ -75,48 +76,96 @@ def export_tuned_yaml(env: RLTuningEnv, action: "np.ndarray", output_dir: str) -
     return save_tuned_config(cfg_out, output_dir=output_dir)
 
 
+def _find_replay_buffer(resume_path: str) -> str | None:
+    resume_dir = os.path.dirname(os.path.abspath(resume_path))
+    stem = os.path.splitext(os.path.basename(resume_path))[0]
+
+    candidates = [
+        os.path.join(resume_dir, f'{stem}_replay_buffer.pkl'),
+    ]
+
+    if stem.endswith('_steps'):
+        parts = stem.rsplit('_', 2)
+        if len(parts) >= 2:
+            step = parts[-2]
+            candidates.extend([
+                os.path.join(resume_dir, f'sac_model_replay_buffer_{step}_steps.pkl'),
+                os.path.join(resume_dir, f'replay_buffer_{step}_steps.pkl'),
+            ])
+
+    candidates.extend(sorted(glob.glob(
+        os.path.join(resume_dir, f'*replay_buffer*{stem}*.pkl'))))
+
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
 def train_rl(plant='hybrid_v2', config_path=None, total_timesteps=50000,
              lr=3e-4, buffer_size=100000, batch_size=256, seed=42,
-             trajectories=None, verbose=True):
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    output_dir = os.path.join(os.path.dirname(__file__), '..',
-                              'results', 'rl', plant, timestamp)
+             trajectories=None, verbose=True, resume_path=None,
+             output_dir=None, checkpoint_freq=10000):
+    if output_dir is None:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_dir = os.path.join(os.path.dirname(__file__), '..',
+                                  'results', 'rl', plant, timestamp)
     os.makedirs(output_dir, exist_ok=True)
 
     env = RLTuningEnv(plant=plant, config_path=config_path, seed=seed,
                       trajectory_types=trajectories)
     eval_env = RLTuningEnv(plant=plant, config_path=config_path, seed=seed + 1000,
-                           trajectory_types=trajectories)
+                           trajectory_types=trajectories,
+                           compute_baseline_losses=False)
+    eval_env._baseline_losses = dict(env._baseline_losses)
+    eval_env._norm_floor = env._norm_floor
 
-    checkpoint_callback = CheckpointCallback(
-        save_freq=10000, save_path=output_dir,
-        name_prefix='sac_model')
+    callbacks = []
+    if checkpoint_freq > 0:
+        callbacks.append(CheckpointCallback(
+            save_freq=checkpoint_freq, save_path=output_dir,
+            name_prefix='sac_model', save_replay_buffer=True))
 
     eval_callback = EvalCallback(
         eval_env, best_model_save_path=output_dir,
         log_path=output_dir, eval_freq=5000,
         deterministic=True, render=False)
+    callbacks.append(eval_callback)
 
-    model = SAC(
-        "MlpPolicy", env,
-        learning_rate=lr,
-        buffer_size=buffer_size,
-        batch_size=batch_size,
-        gamma=0.99,
-        tau=0.005,
-        ent_coef='auto',
-        verbose=1 if verbose else 0,
-        seed=seed,
-        tensorboard_log=output_dir,
-    )
+    if resume_path:
+        model = SAC.load(resume_path, env=env, tensorboard_log=output_dir)
+        replay_buffer_path = _find_replay_buffer(resume_path)
+        if replay_buffer_path:
+            model.load_replay_buffer(replay_buffer_path)
+            if verbose:
+                print(f"  Resume replay buffer: {replay_buffer_path}")
+        elif verbose:
+            print("  Resume replay buffer: not found, continuing with empty buffer")
+        if verbose:
+            print(f"  Resume model: {resume_path}")
+            print(f"  Resume num_timesteps: {model.num_timesteps}")
+    else:
+        model = SAC(
+            "MlpPolicy", env,
+            learning_rate=lr,
+            buffer_size=buffer_size,
+            batch_size=batch_size,
+            gamma=0.99,
+            tau=0.005,
+            ent_coef='auto',
+            verbose=1 if verbose else 0,
+            seed=seed,
+            tensorboard_log=output_dir,
+        )
 
     import time as _time
     t_start = _time.time()
 
     model.learn(
         total_timesteps=total_timesteps,
-        callback=CallbackList([checkpoint_callback, eval_callback]),
+        callback=CallbackList(callbacks),
         log_interval=100,
+        reset_num_timesteps=not bool(resume_path),
     )
 
     elapsed = _time.time() - t_start
@@ -124,6 +173,7 @@ def train_rl(plant='hybrid_v2', config_path=None, total_timesteps=50000,
 
     model_path = os.path.join(output_dir, 'sac_model_final')
     model.save(model_path)
+    model.save_replay_buffer(os.path.join(output_dir, 'sac_model_final_replay_buffer.pkl'))
 
     best_obs = env._build_obs()
     best_action, _ = model.predict(best_obs, deterministic=True)
@@ -141,6 +191,7 @@ def train_rl(plant='hybrid_v2', config_path=None, total_timesteps=50000,
         'yaml_path': yaml_path,
         'output_dir': output_dir,
         'elapsed_seconds': elapsed,
+        'num_timesteps': model.num_timesteps,
     }
 
 
@@ -163,6 +214,12 @@ if __name__ == '__main__':
                         help='随机种子')
     parser.add_argument('--trajectories', nargs='+', default=None,
                         help='轨迹类型名，默认全量 48 条')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to a SAC .zip checkpoint/model for continued training')
+    parser.add_argument('--output-dir', type=str, default=None,
+                        help='Output directory; useful when resuming into an existing run')
+    parser.add_argument('--checkpoint-freq', type=int, default=10000,
+                        help='Checkpoint save frequency in timesteps; <=0 disables periodic checkpoints')
     args = parser.parse_args()
 
     train_rl(
@@ -174,4 +231,7 @@ if __name__ == '__main__':
         batch_size=args.batch_size,
         seed=args.seed,
         trajectories=args.trajectories,
+        resume_path=args.resume,
+        output_dir=args.output_dir,
+        checkpoint_freq=args.checkpoint_freq,
     )

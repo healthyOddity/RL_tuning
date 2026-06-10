@@ -455,27 +455,81 @@ RL 环境直接复用 DC 框架的以下模块（零改写）：
 
 ## 十、常用命令
 
-```bash
+```powershell
 cd differentiable-control/sim
 
-# 环境测试
-python -m pytest tests/test_rl_env.py -v
+# 0. 推荐使用 pypose 环境的 Python，避免 PowerShell 中 conda activate 未生效
+C:\Users\huangjiangyu\.conda\envs\pypose\python.exe -c "import stable_baselines3; print(stable_baselines3.__version__)"
 
-# SAC 训练
-python optim/rl_train.py --plant kinematic --total-timesteps 50000
+# 1. 环境/语法检查
+C:\Users\huangjiangyu\.conda\envs\pypose\python.exe -m py_compile optim/rl_train.py optim/rl_evaluate.py optim/rl_env.py
 
-# 评估对比
-python optim/rl_evaluate.py \
-    --rl-model results/rl/kinematic/xxx/sac_model_final \
-    --dc-config configs/default.yaml \
-    --plant kinematic
+# 2. DC/BPTT 参数整定主流程（truck_trailer）
+# train_batch.py 是 truck_trailer 当前主线，输出 tuned_*.yaml 作为 RL warm-start baseline。
+C:\Users\huangjiangyu\.conda\envs\pypose\python.exe optim/train_batch.py `
+    --plant truck_trailer `
+    --epochs 50
 
-# 完整流程（BPTT → SAC → 评估）
-python optim/train.py --plant kinematic --epochs 6
-python optim/rl_train.py --plant kinematic --config configs/tuned/xxx.yaml
-python optim/rl_evaluate.py \
-    --rl-model results/rl/kinematic/xxx/sac_model_final \
-    --dc-config configs/tuned/xxx.yaml
+# 3. RL/SAC 从 DC tuned baseline 开始训练（truck_trailer）
+# --checkpoint-freq 会周期性保存 sac_model_{N}_steps.zip 和对应 replay buffer。
+C:\Users\huangjiangyu\.conda\envs\pypose\python.exe optim/rl_train.py `
+    --plant truck_trailer `
+    --config "results/training/truck_trailer/20260608_203406_mlp0525/tuned_4740dec_20260608_203243.yaml" `
+    --total-timesteps 20000 `
+    --checkpoint-freq 1000
+
+# 4. 指定输出目录训练，便于断点续训写回同一个 run
+C:\Users\huangjiangyu\.conda\envs\pypose\python.exe optim/rl_train.py `
+    --plant truck_trailer `
+    --config "results/training/truck_trailer/20260608_203406_mlp0525/tuned_4740dec_20260608_203243.yaml" `
+    --total-timesteps 20000 `
+    --checkpoint-freq 1000 `
+    --output-dir "results/rl/truck_trailer/202606xx_xxxxxx"
+
+# 5. 从 checkpoint / best_model / final_model 断点续训
+# --total-timesteps 表示本次额外继续训练多少步，不是累计总步数。
+# 新版本 checkpoint 会保存 replay buffer；旧 best_model.zip 没有 replay buffer 时会用空 buffer 继续。
+C:\Users\huangjiangyu\.conda\envs\pypose\python.exe optim/rl_train.py `
+    --plant truck_trailer `
+    --config "results/training/truck_trailer/20260608_203406_mlp0525/tuned_4740dec_20260608_203243.yaml" `
+    --resume "results/rl/truck_trailer/20260609_175233/best_model.zip" `
+    --output-dir "results/rl/truck_trailer/20260609_175233" `
+    --total-timesteps 15000 `
+    --checkpoint-freq 1000
+
+# 6. 查看模型实际累计 timesteps
+C:\Users\huangjiangyu\.conda\envs\pypose\python.exe -c "from stable_baselines3 import SAC; m=SAC.load(r'results/rl/truck_trailer/20260609_175233/best_model.zip'); print(m.num_timesteps)"
+
+# 7. RL vs DC tuned baseline 评估（默认 48 条标准轨迹）
+C:\Users\huangjiangyu\.conda\envs\pypose\python.exe optim/rl_evaluate.py `
+    --rl-model "results/rl/truck_trailer/202606xx_xxxxxx/sac_model_final.zip" `
+    --dc-config "results/training/truck_trailer/20260608_203406_mlp0525/tuned_4740dec_20260608_203243.yaml" `
+    --plant truck_trailer `
+    --output-dir "results/rl/truck_trailer/202606xx_xxxxxx/evaluation"
+
+# 8. 追加 park_route 综合园区路线评估（48 + 1）
+# park_route 是强 OOD / 综合路线，用于诊断泛化边界，不建议直接等同于标准训练集表现。
+C:\Users\huangjiangyu\.conda\envs\pypose\python.exe optim/rl_evaluate.py `
+    --rl-model "results/rl/truck_trailer/202606xx_xxxxxx/sac_model_final.zip" `
+    --dc-config "results/training/truck_trailer/20260608_203406_mlp0525/tuned_4740dec_20260608_203243.yaml" `
+    --plant truck_trailer `
+    --include-park-route `
+    --output-dir "results/rl/truck_trailer/202606xx_xxxxxx/evaluation_with_park_route"
+
+# 9. 只训练/评估部分轨迹类型，用于 smoke test 或定位问题
+C:\Users\huangjiangyu\.conda\envs\pypose\python.exe optim/rl_train.py `
+    --plant truck_trailer `
+    --config "results/training/truck_trailer/20260608_203406_mlp0525/tuned_4740dec_20260608_203243.yaml" `
+    --trajectories lane_change `
+    --total-timesteps 1000 `
+    --checkpoint-freq 500
+
+C:\Users\huangjiangyu\.conda\envs\pypose\python.exe optim/rl_evaluate.py `
+    --rl-model "results/rl/truck_trailer/202606xx_xxxxxx/sac_model_final.zip" `
+    --dc-config "results/training/truck_trailer/20260608_203406_mlp0525/tuned_4740dec_20260608_203243.yaml" `
+    --plant truck_trailer `
+    --trajectories lane_change `
+    --output-dir "results/rl/truck_trailer/202606xx_xxxxxx/evaluation_lane_change"
 ```
 
 ---
