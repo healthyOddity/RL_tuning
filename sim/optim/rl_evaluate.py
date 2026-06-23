@@ -12,6 +12,7 @@ import os
 import sys
 import torch
 import numpy as np
+import yaml
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -121,6 +122,8 @@ def evaluate_rl_model(model_path, plant, dc_config_path, output_dir=None,
             'delta_pct': (rl_loss - dc_loss) / max(dc_loss, 1e-8) * 100,
             'is_ood': is_ood,
             'rl_action': rl_action.copy(),
+            'rl_metrics': rl_metrics,
+            'dc_metrics': dc_metrics,
         })
         print(f"  {key:30s}  RL={rl_loss:.4f}  DC={dc_loss:.4f}  "
               f"Δ={rl_loss-dc_loss:+.4f} ({(rl_loss-dc_loss)/max(dc_loss,1e-8)*100:+.1f}%){ood_label}")
@@ -154,8 +157,44 @@ def evaluate_rl_model(model_path, plant, dc_config_path, output_dir=None,
                               plot_type='steer', filename='comparison_steer.png')
         _plot_comparison_grid(all_base, all_tuned, output_dir,
                               plot_type='acc', filename='comparison_acc.png')
+        yaml_path = _save_eval_results(
+            results, output_dir, rl_mean, dc_mean, win_count, ood_count)
+        print(f"  结构化结果: {yaml_path}")
 
     return results
+
+
+def _to_plain(value):
+    if isinstance(value, np.ndarray):
+        return [_to_plain(v) for v in value.tolist()]
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {k: _to_plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_plain(v) for v in value]
+    return value
+
+
+def _save_eval_results(results, output_dir, rl_mean, dc_mean, win_count, ood_count):
+    os.makedirs(output_dir, exist_ok=True)
+    trajectory_count = len(results)
+    payload = {
+        'summary': {
+            'trajectory_count': trajectory_count,
+            'rl_avg_loss': _to_plain(rl_mean),
+            'dc_avg_loss': _to_plain(dc_mean),
+            'delta': _to_plain(rl_mean - dc_mean),
+            'delta_pct': _to_plain((rl_mean - dc_mean) / max(dc_mean, 1e-8) * 100),
+            'win_count': int(win_count),
+            'ood_count': int(ood_count),
+        },
+        'results': [_to_plain(r) for r in results],
+    }
+    path = os.path.join(output_dir, 'rl_eval_results.yaml')
+    with open(path, 'w', encoding='utf-8') as f:
+        yaml.safe_dump(payload, f, allow_unicode=True, sort_keys=False)
+    return path
 
 
 def _plot_comparison(results, rl_mean, dc_mean, win_count, output_dir):

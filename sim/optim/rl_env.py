@@ -120,7 +120,8 @@ class RLTuningEnv(gym.Env):
     ], dtype=np.float32)
 
     def __init__(self, plant='hybrid_v2', config_path=None, seed=None,
-                 trajectory_types=None, compute_baseline_losses=True):
+                 trajectory_types=None, compute_baseline_losses=True,
+                 baseline_stats=None):
         super().__init__()
 
         self.seed_val = seed
@@ -143,7 +144,9 @@ class RLTuningEnv(gym.Env):
 
         self._setup_trajectories(trajectory_types)
         self._precompute_features()
-        if compute_baseline_losses:
+        if baseline_stats is not None:
+            self._load_baseline_stats(baseline_stats)
+        elif compute_baseline_losses:
             self._precompute_baseline_losses()
 
         self.episode_count = 0
@@ -296,6 +299,33 @@ class RLTuningEnv(gym.Env):
         median_baseline = sorted_baselines[len(sorted_baselines) // 2]
         self._norm_floor = median_baseline ** 0.5
         print(f"  [RLTuningEnv] baseline loss 预计算完成, norm_floor={self._norm_floor:.4f}")
+
+    def _load_baseline_stats(self, baseline_stats):
+        losses = dict(baseline_stats['losses'])
+        missing = sorted(set(self._traj_keys_list) - set(losses))
+        if missing:
+            raise ValueError(
+                f"baseline_stats missing trajectory keys: {', '.join(missing)}")
+
+        selected_losses = {}
+        for key in self._traj_keys_list:
+            loss = float(losses[key])
+            if not np.isfinite(loss) or loss <= 0.0:
+                raise ValueError(f"invalid baseline loss for {key}: {loss}")
+            selected_losses[key] = loss
+
+        norm_floor = float(baseline_stats['norm_floor'])
+        if not np.isfinite(norm_floor) or norm_floor <= 0.0:
+            raise ValueError(f"invalid baseline norm_floor: {norm_floor}")
+
+        self._baseline_losses = selected_losses
+        self._norm_floor = norm_floor
+
+    def export_baseline_stats(self):
+        return {
+            'losses': dict(self._baseline_losses),
+            'norm_floor': float(self._norm_floor),
+        }
 
     def _build_obs(self) -> np.ndarray:
         params = np.array([

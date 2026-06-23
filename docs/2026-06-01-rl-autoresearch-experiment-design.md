@@ -6,11 +6,134 @@
 
 本文基于 `docs/2026-06-01-rl-experiment-roadmap-discussion.md` 和当前代码状态，将后续研究拆成可逐步执行、可审核、可填写结果的实验协议。本文采用有人在环的 autoresearch 流程：每个实验先确认 protocol，再执行命令或补代码，跑完后只把经过 sanity check 的结果写入结论。
 
+## 2026-06-11 更新：当前 truck_trailer 证据状态与执行顺序
+
+当前 truck_trailer 主线已经从历史 `hybrid_v2` 探索切换为以下组合：
+
+```text
+DC baseline:
+sim/results/training/truck_trailer/20260608_203406_mlp0525/tuned_4740dec_20260608_203243.yaml
+
+RL run:
+sim/results/rl/truck_trailer/20260609_175233/
+```
+
+对 `20260609_175233` 的当前状态检查：
+
+| 文件/记录 | 状态 |
+|---|---|
+| `sac_model_final.zip` | 存在 |
+| `best_model.zip` | 存在 |
+| `sac_model_17000_steps.zip` | 存在 |
+| `sac_model_final_replay_buffer.pkl` | 存在 |
+| `evaluations.npz` | 存在，评估 timesteps 为 `[12000, 17000]` |
+| 模型内部 `num_timesteps` | `best_model.zip`、`sac_model_17000_steps.zip`、`sac_model_final.zip` 均为 `17000` |
+| `evaluation/` | 已生成，包含 `result.txt`、`rl_vs_dc_comparison.png` 和 comparison 系列 png |
+| `evaluation_with_park_route/` | 已生成，包含 `rl_eval_results.yaml`、`rl_vs_dc_comparison.png` 和 comparison 系列 png |
+
+对 `20260608_203406_mlp0525` 的 DC/BPTT 结果检查：
+
+| 指标 | Default | DC tuned | 改善 |
+|---|---:|---:|---:|
+| training loss | 3.9215 | 1.0190 | -74.02% |
+| avg lat RMSE, 49 场景 | 1.0539 m | 0.3124 m | -70.36% |
+| avg head RMSE, 49 场景 | 0.0350 rad | 0.0235 rad | -32.82% |
+| lat RMSE 改善场景数 | - | 45/49 | - |
+| head RMSE 改善场景数 | - | 44/49 | - |
+
+当前阶段性结论：
+
+1. **E02 Default vs DC 已完成**：`20260608_203406_mlp0525` 可作为 truck_trailer 主线的 DC baseline 结果。
+2. **E01 DC+RL 正式评估已完成**：`20260609_175233/evaluation/result.txt` 显示 DC+RL 在标准 48 条轨迹上 avg loss 从 4.0761 降到 2.9773，平均改善 27.0%，胜出 39/48。
+3. **E01P park_route 诊断已完成**：`evaluation_with_park_route/rl_eval_results.yaml` 显示 49 场景中 OOD 数量为 1，`park_route` 被标记为 OOD，且 DC+RL 在该场景上严重退化。
+4. 在 Pure RL 对照和四臂汇总完成前，不应直接进入 rolling 部署或论文最终结论。
+
+### E01 当前执行入口：truck_trailer DC+RL 正式评估（48 条标准轨迹）
+
+目的：回答当前 17000-step SAC policy 是否在 truck_trailer 标准 48 条轨迹上优于 DC tuned baseline。该入口对应正文第 4 节 E01，不再把历史 `hybrid_v2/20260526_195622` 作为当前主线 E01。
+
+```powershell
+cd C:\Users\huangjiangyu\Desktop\hirain\L4\train_file\differentiable-control\sim
+C:\Users\huangjiangyu\.conda\envs\pypose\python.exe optim/rl_evaluate.py `
+  --rl-model results/rl/truck_trailer/20260609_175233/sac_model_final.zip `
+  --dc-config results/training/truck_trailer/20260608_203406_mlp0525/tuned_4740dec_20260608_203243.yaml `
+  --plant truck_trailer `
+  --output results/rl/truck_trailer/20260609_175233/evaluation
+```
+
+建议同时把终端输出保存为日志，因为当前 `rl_evaluate.py` 主要保存图片，不保存完整 per-scenario 数值表：
+
+```powershell
+New-Item -ItemType Directory -Force results/rl/truck_trailer/20260609_175233/evaluation
+# PowerShell 中可把 E01-TT 命令末尾追加：
+2>&1 | Tee-Object results/rl/truck_trailer/20260609_175233/evaluation/log.txt
+```
+
+成功标准：
+
+| 检查项 | 标准 |
+|---|---|
+| 输出目录 | `evaluation/` 生成 comparison 系列 png |
+| 轨迹数 | 48 |
+| 关键指标 | 记录 RL avg loss、DC avg loss、胜出轨迹数、OOD 数 |
+| 结论口径 | 只评价 48 条标准轨迹，不包含 park_route |
+
+### E01P：truck_trailer + park_route 泛化诊断
+
+目的：把 `park_route` 作为强 OOD / 综合路线压力测试，诊断 one-shot 全局参数 agent 的边界。它不应与 48 条标准轨迹混在一起作为同一个结论。
+
+```powershell
+cd C:\Users\huangjiangyu\Desktop\hirain\L4\train_file\differentiable-control\sim
+C:\Users\huangjiangyu\.conda\envs\pypose\python.exe optim/rl_evaluate.py `
+  --rl-model results/rl/truck_trailer/20260609_175233/sac_model_final.zip `
+  --dc-config results/training/truck_trailer/20260608_203406_mlp0525/tuned_4740dec_20260608_203243.yaml `
+  --plant truck_trailer `
+  --include-park-route `
+  --output results/rl/truck_trailer/20260609_175233/evaluation_with_park_route
+```
+
+解释原则：
+
+- 若 48 条标准轨迹效果好，而 `park_route` 差，优先解释为 one-shot trajectory-level agent 对复合路线的能力边界。
+- 若 48 条标准轨迹也不稳定，先检查 RL action、reward、训练步数、baseline loss 归一化和评估脚本，而不是推进 rolling scheduling。
+- `park_route` 后续更适合进入 rolling preview 参数调度实验：未来 5s 局部轨迹特征 -> 周期调用 agent -> 参数平滑/限速/OOD 回退。
+
+E01P 已在 2026-06-15 使用同一 DC baseline 和 `20260609_175233/sac_model_final.zip` 完成。结构化结果保存在：
+
+```text
+sim/results/rl/truck_trailer/20260609_175233/evaluation_with_park_route/rl_eval_results.yaml
+```
+
+| 指标 | 数值 |
+|---|---:|
+| 场景数 | 49 |
+| RL avg loss | 157467.5696 |
+| DC avg loss | 4.5817 |
+| RL 胜出轨迹数 | 39/49 |
+| OOD 数量 | 1/49 |
+| `park_route` RL loss | 7715768.0000 |
+| `park_route` DC loss | 28.8503 |
+| `park_route` RL lat RMSE | 877.9075 m |
+| `park_route` DC lat RMSE | 0.5638 m |
+
+E01P 的结论是：标准 48 条轨迹上的 DC+RL 整体收益不能外推到 `park_route`。当前 SAC policy 在 `park_route` 上输出接近动作边界的参数调整，导致 tracking loss 和横向误差极端放大；这更像 one-shot trajectory-level policy 对强 OOD/复合路线的能力边界，而不是标准轨迹结论被推翻。因此后续不应把 `park_route` 并入 48 条均值，也不应在没有 OOD fallback、参数限速和平滑机制前推进部署 claim。
+
+### E01A：评估后必须补的诊断能力
+
+无论 E01-TT 结果好坏，都建议在下一轮代码改进中优先补：
+
+1. `rl_evaluate.py` 保存 per-scenario 结果表，例如 `rl_eval_results.yaml` 或 `.csv`。
+2. 每条轨迹记录 `rl_loss`、`dc_loss`、`delta_pct`、`lat_rmse`、`head_rmse`、`is_ood`、`ood_distance`、`rl_action`。
+3. 增加 `--ood-policy none|scale|fallback_dc`，先只用于评估，不改变训练。
+4. 增加 action 分布检查：是否贴边、是否某些维度长期饱和。
+
+这一步比继续盲目加 timesteps 更重要，因为当前 RL 是否有效要先靠逐轨迹诊断判断。
+
 ## 0. 当前证据与代码状态
 
 ### 0.1 已有关键实验
 
-已有实验目录：
+已有历史探索实验目录：
 
 ```text
 sim/results/rl/hybrid_v2/20260526_195622/
@@ -30,6 +153,14 @@ sim/results/rl/hybrid_v2/20260526_195622/
 ```text
 sim/results/rl/hybrid_v2/20260526_195622/evaluation/log.txt
 ```
+
+当前 truck_trailer 主线已有结果：
+
+| 实验 | 目录 | 状态 | 关键结论 |
+|---|---|---|---|
+| E02: Default vs DC | `sim/results/training/truck_trailer/20260608_203406_mlp0525/` | 已完成 | training loss -74.02%；49 场景 avg lat RMSE -70.36%；avg head RMSE -32.82% |
+| E01: DC vs DC+RL | `sim/results/rl/truck_trailer/20260609_175233/` | 已完成标准 48 条评估 | RL avg loss 2.9773，DC avg loss 4.0761，平均改善 -27.0%，RL 胜出 39/48 |
+| E01P: park_route 诊断 | 同上 | 已完成 | `park_route` 被判定为 OOD；RL loss 7715768.0000 vs DC loss 28.8503，说明 one-shot policy 在强 OOD/复合路线下失效 |
 
 ### 0.2 当前代码支持矩阵
 
@@ -104,7 +235,7 @@ cd C:\Users\huangjiangyu\Desktop\hirain\L4\train_file\differentiable-control\sim
 | E11 | safe scheduling / 参数表调度 | 对齐部署安全路线 | 否，需要新 baseline | P2 |
 | E12 | RL policy 应用验证 | 把 policy 当作参数调度器评估 | 部分，需要真实/回放数据接口 | P2 |
 
-建议先完成 E00-E05，再决定是否投入 E06-E12。理由：如果基础复现、四臂消融和加速收益不成立，后面的复杂研究分支不值得立即展开。
+建议先完成当前 truck_trailer 主线的 E03/E04，再决定是否投入 E05-E12。理由：E01、E01P 和 E02 已完成，当前最缺的是 Pure RL 对照和四臂汇总；如果四臂消融不成立，后面的算法对比、rolling 部署和 Gradient-Informed SAC 都缺少主 claim 支撑。
 
 ## 3. E00：运行环境与复现性 Smoke Test
 
@@ -158,28 +289,28 @@ print("trajectory:", info["trajectory_key"])
 | 报错/异常 |  |
 | 备注 |  |
 
-## 4. E01：复现已有 DC vs DC+RL
+## 4. E01：truck_trailer DC vs DC+RL 正式评估
 
 ### 4.1 目的
 
-确认 `20260526_195622` 的 DC+RL 结果可以用当前代码重新评估，避免后续分析基于不可复现结果。
+确认当前 truck_trailer 主线的 17000-step SAC policy 是否能在标准 48 条轨迹上优于 DC tuned baseline。该实验是四臂消融中的 **B vs D**，也是后续算法对比、rolling 部署和论文结论的前置门槛。
 
 ### 4.2 实验组
 
 | 组别 | 配置/模型 |
 |---|---|
-| DC | `configs/tuned/tuned_2cdcb49_20260526_193652.yaml` |
-| DC+RL | `results/rl/hybrid_v2/20260526_195622/sac_model_final.zip` |
+| DC | `results/training/truck_trailer/20260608_203406_mlp0525/tuned_4740dec_20260608_203243.yaml` |
+| DC+RL | `results/rl/truck_trailer/20260609_175233/sac_model_final.zip` |
 
 ### 4.3 执行命令
 
 ```powershell
 cd C:\Users\huangjiangyu\Desktop\hirain\L4\train_file\differentiable-control\sim
-python optim/rl_evaluate.py `
-  --rl-model results/rl/hybrid_v2/20260526_195622/sac_model_final.zip `
-  --dc-config configs/tuned/tuned_2cdcb49_20260526_193652.yaml `
-  --plant hybrid_v2 `
-  --output results/rl/hybrid_v2/20260526_195622/evaluation_rerun_20260601
+C:\Users\huangjiangyu\.conda\envs\pypose\python.exe optim/rl_evaluate.py `
+  --rl-model results/rl/truck_trailer/20260609_175233/sac_model_final.zip `
+  --dc-config results/training/truck_trailer/20260608_203406_mlp0525/tuned_4740dec_20260608_203243.yaml `
+  --plant truck_trailer `
+  --output results/rl/truck_trailer/20260609_175233/evaluation
 ```
 
 ### 4.4 成功标准
@@ -187,30 +318,29 @@ python optim/rl_evaluate.py `
 | 指标 | 预期 |
 |---|---|
 | 轨迹数 | 48 |
-| DC+RL 胜出数 | 接近或等于 48/48 |
-| 平均改善 | 接近已有 -31.0% |
+| DC+RL 胜出数 | 明显多于 DC 胜出数，最好接近 48/48 |
+| 平均改善 | DC+RL avg loss 低于 DC avg loss |
 | 输出图 | comparison 系列 png 生成 |
+| 日志 | 保存终端输出或后续生成 per-scenario 结果表 |
 
 ### 4.5 结果填写
 
-| 指标 | 原始结果 | 复现实验结果 |
-|---|---:|---:|
-| DC avg loss | 59.1975 |  |
-| DC+RL avg loss | 40.8389 |  |
-| 平均改善 | -31.0% |  |
-| 胜出轨迹数 | 48/48 |  |
-| OOD 数量 |  |  |
+| 指标 | DC | DC+RL | 改善 |
+|---|---:|---:|---:|
+| avg loss | 4.0761 | 2.9773 | -27.0% |
+| 胜出轨迹数 | 9/48 | 39/48 | +30 条 |
+| OOD 数量 | 未记录 | 未记录 | 标准 48 条不含 `park_route` |
 
 结论填写：
 
 ```text
-
+E01 标准 48 条 truck_trailer 轨迹评估已完成。`20260609_175233` 的 17000-step SAC policy 在 DC tuned baseline 基础上继续降低平均 tracking loss：DC avg loss 为 4.0761，DC+RL avg loss 为 2.9773，平均改善 27.0%，并在 39/48 条轨迹上优于 DC。因此当前证据支持“DC+RL 在标准 in-distribution 轨迹上整体优于 DC”的阶段性结论。需要保留的限制是：9 条轨迹仍然退化，当前 `result.txt` 不是结构化 per-scenario 表，也未记录 action 分布、OOD 标记和 `park_route` 诊断，所以该结果还不能直接外推到强 OOD、rolling 调度或部署安全 claim。
 ```
 
 异常记录：
 
 ```text
-
+`evaluation/result.txt` 中逐轨迹文本存在少量重复行，但末尾总体统计完整，本文仅引用总体统计和可直接核验的胜出轨迹数。后续应优先让 `rl_evaluate.py` 输出结构化 CSV/YAML，避免人工从终端文本整理结果。
 ```
 
 ## 5. E02：Default vs DC
@@ -221,23 +351,22 @@ python optim/rl_evaluate.py `
 
 ### 5.2 当前可行性
 
-可直接执行。`post_training.py` 支持 `hybrid_v2` 的 scalar per-scenario 验证。
+已完成。`sim/results/training/truck_trailer/20260608_203406_mlp0525/` 是当前 truck_trailer 主线的 DC/BPTT 结果目录，包含训练曲线、49 场景验证图、`experiment_log.yaml` 和 tuned YAML。
 
 ### 5.3 执行命令
 
 ```powershell
 cd C:\Users\huangjiangyu\Desktop\hirain\L4\train_file\differentiable-control\sim
-python optim/post_training.py `
-  --config configs/tuned/tuned_2cdcb49_20260526_193652.yaml `
-  --plant hybrid_v2 `
-  --output-dir results/validation/hybrid_v2/E02_default_vs_dc_20260601
+C:\Users\huangjiangyu\.conda\envs\pypose\python.exe optim/train_batch.py `
+  --epochs 50 `
+  --plant truck_trailer
 ```
 
 ### 5.4 成功标准
 
 | 指标 | 预期 |
 |---|---|
-| 场景数 | 48 或 49，取决于 post_training 是否包含 `park_route` |
+| 场景数 | 49，包含 48 条标准轨迹 + `park_route` |
 | DC 平均 lat/head RMSE | 优于 default |
 | 退化场景 | 需要列出，不能只报均值 |
 
@@ -245,22 +374,26 @@ python optim/post_training.py `
 
 | 指标 | Default | DC | 改善 |
 |---|---:|---:|---:|
-| avg lat RMSE |  |  |  |
-| avg head RMSE |  |  |  |
-| avg speed RMSE |  |  |  |
-| improved scenarios |  |  |  |
-| degraded scenarios |  |  |  |
+| training loss | 3.9215 | 1.0190 | -74.02% |
+| avg lat RMSE, 49 场景 | 1.0539 m | 0.3124 m | -70.36% |
+| avg head RMSE, 49 场景 | 0.0350 rad | 0.0235 rad | -32.82% |
+| lat improved scenarios | - | 45/49 | - |
+| head improved scenarios | - | 44/49 | - |
 
 代表性退化场景：
 
 | 场景 | Default | DC | 退化比例 | 备注 |
 |---|---:|---:|---:|---|
-|  |  |  |  |  |
+| `s_curve_25kph` lat RMSE | 0.2419 | 0.2662 | +10.04% | head RMSE 同时退化 +90.73% |
+| `clothoid_decel_18kph` lat RMSE | 0.1845 | 0.2134 | +15.68% | head RMSE 仍改善 |
+| `lc_accel_18kph` lat RMSE | 0.1898 | 0.2562 | +34.98% | head RMSE 同时退化 +73.31% |
+| `park_route` lat RMSE | 0.2695 | 0.5416 | +101.00% | 综合园区路线，强 OOD/复合路线压力测试 |
+| `clothoid_decel_35kph` head RMSE | 0.0509 | 0.0570 | +11.89% | lat RMSE 仍改善 -16.6% |
 
 结论填写：
 
 ```text
-
+E02 已完成。DC/BPTT 对 truck_trailer 的整体收益明确：训练 loss 降低 74.02%，49 场景平均 lat RMSE 降低 70.36%，平均 head RMSE 降低 32.82%。但 DC tuned baseline 不是全场景无退化，`park_route`、`lc_accel_18kph`、`s_curve_25kph` 等场景存在局部退化。因此 E02 支持“DC 相比 default 有显著总体收益”，同时也给后续 RL 场景自适应和 rolling 调度留下动机。
 ```
 
 ## 6. E03：Pure RL around Default/Random
@@ -283,26 +416,26 @@ python optim/post_training.py `
 ```powershell
 cd C:\Users\huangjiangyu\Desktop\hirain\L4\train_file\differentiable-control\sim
 python optim/rl_train.py `
-  --plant hybrid_v2 `
+  --plant truck_trailer `
   --config configs/default.yaml `
-  --total-timesteps 20000 `
+  --total-timesteps 17000 `
   --seed 42
 ```
 
 训练完成后记录输出目录，例如：
 
 ```text
-results/rl/hybrid_v2/<PURE_RL_RUN_ID>/
+results/rl/truck_trailer/20260615_155054/
 ```
 
 然后评估 Pure RL 相对 default：
 
 ```powershell
 python optim/rl_evaluate.py `
-  --rl-model results/rl/hybrid_v2/<PURE_RL_RUN_ID>/sac_model_final.zip `
+  --rl-model results/rl/truck_trailer/20260615_155054/sac_model_final.zip `
   --dc-config configs/default.yaml `
-  --plant hybrid_v2 `
-  --output results/rl/hybrid_v2/<PURE_RL_RUN_ID>/evaluation_vs_default
+  --plant truck_trailer `
+  --output results/rl/truck_trailer/20260615_155054/evaluation
 ```
 
 ### 6.4 执行命令：Pure RL-random，可选
@@ -328,13 +461,15 @@ python optim/rl_train.py `
 
 | 实验 | seed | baseline config | run id | baseline avg loss | RL avg loss | 改善 | 胜出轨迹数 |
 |---|---:|---|---|---:|---:|---:|---:|
-| Pure RL-default | 42 | `configs/default.yaml` |  |  |  |  |  |
+| Pure RL-default | 42 | `configs/default.yaml` | `20260615_155054` | 32.1460 | 12.9343 | -59.8% | 48/48 |
 | Pure RL-random | 42 | `configs/random_seed123.yaml` |  |  |  |  |  |
+
+注：上表只统计标准 48 条轨迹，明确排除 `park_route`。含 `park_route` 的 `rl_eval_results.yaml` 总表中 49 条均值会被千万级 OOD loss 主导，不能作为四臂消融的 avg loss。`park_route` 只进入 OOD/部署安全诊断。
 
 结论填写：
 
 ```text
-
+E03 Pure RL-default 已完成。结果来自 `results/rl/truck_trailer/20260615_155054/evaluation/rl_eval_results.yaml`，并按 `is_ood=false` 过滤出标准 48 条轨迹后重新计算：Default avg loss 为 32.1460，Pure RL avg loss 为 12.9343，Pure RL 胜出 48/48，平均 loss 降低 59.8%。这说明不使用 DC warm-start 时，SAC 仍能围绕 default 学到有效参数调度；但 Pure RL 的 12.9343 仍明显弱于 DC 的 4.0761 和 DC+RL 的 2.9773。因此单 seed 证据支持“DC warm-start 是当前最优路线的重要前置”，但最终稳定性还需要 E08 多 seed 验证。
 ```
 
 ## 7. E04：四臂消融汇总
@@ -346,13 +481,13 @@ python optim/rl_train.py `
 | 版本 | 名称 | 定义 |
 |---|---|---|
 | A | Default | `configs/default.yaml` |
-| B | DC | `configs/tuned/tuned_2cdcb49_20260526_193652.yaml` |
-| C | Pure RL | `rl_train.py --config configs/default.yaml` 训练出的 policy |
-| D | DC+RL | `20260526_195622/sac_model_final.zip` |
+| B | DC | `results/training/truck_trailer/20260608_203406_mlp0525/tuned_4740dec_20260608_203243.yaml` |
+| C | Pure RL | `results/rl/truck_trailer/20260615_155054/sac_model_final.zip`，baseline 为 `configs/default.yaml` |
+| D | DC+RL | `results/rl/truck_trailer/20260609_175233/sac_model_final.zip`，baseline 为 B |
 
 ### 7.2 当前可行性
 
-部分可直接执行。A vs B、A vs C、B vs D 都有现有入口；但 A/B/C/D 四臂统一表需要把 `post_training.py` 和 `rl_evaluate.py` 的日志合并，建议补一个小脚本。
+当前四臂主实验的单 seed 证据已经基本完成。A vs B 由 E02 支撑，A vs C 由 E03 支撑，B vs D 由 E01 支撑；A/B/C/D 逐轨迹统一表仍建议补一个小脚本从结构化 YAML/日志中生成，避免后续多 seed 时手工整理出错。
 
 ### 7.3 建议补充脚本
 
@@ -384,17 +519,17 @@ sim/optim/rl_collect_ablation.py
 
 | 对比 | 平均改善 | 胜出轨迹数 | 结论 |
 |---|---:|---:|---|
-| A vs B |  |  |  |
-| A vs C |  |  |  |
-| A vs D |  |  |  |
-| B vs D |  |  |  |
-| C vs D |  |  |  |
-| B vs C |  |  |  |
+| A vs B | -87.3% | 待逐轨迹表固化 | DC/BPTT 是主收益来源 |
+| A vs C | -59.8% | 48/48 | Pure RL 有效，但弱于 DC |
+| A vs D | -90.7% | 待逐轨迹表固化 | DC+RL 是当前最强单 seed 方案 |
+| B vs D | -27.0% | 39/48 | RL 在 DC warm-start 基础上继续提供增益 |
+| C vs D | DC+RL 比 Pure RL 低 77.0% | 待逐轨迹表固化 | DC warm-start 明显优于从 default 直接 RL |
+| B vs C | Pure RL 比 DC 高 217.3% | 待逐轨迹表固化 | Pure RL 尚不能替代 DC/BPTT |
 
 结论填写：
 
 ```text
-
+四臂主线的单 seed 结论已经基本闭环：Default 最弱，Pure RL 明显改善 Default 但仍弱于 DC，DC+RL 在标准 48 条 in-distribution 轨迹上最强。当前最稳妥的论文表述是“可微整定提供主要全局收益，RL 在 DC warm-start 上提供场景自适应增益”；不应表述为“纯 RL 可替代 DC”，也不应把 `park_route` 纳入四臂 avg loss。`park_route` 是 OOD/部署安全诊断，应单列。
 ```
 
 ## 8. E05：RL 环境 step 吞吐 benchmark
@@ -405,14 +540,14 @@ sim/optim/rl_collect_ablation.py
 
 ### 8.2 当前可行性
 
-当前没有 benchmark 脚本，需要新增最小脚本。建议先不要改 `rl_train.py`。
+当前没有 benchmark 脚本，需要新增最小脚本。E05 只新增独立 benchmark，不改 `rl_train.py`，目的是先回答“并行环境是否值得接入训练”。
 
 ### 8.3 建议补充脚本
 
 新增：
 
 ```text
-sim/optim/bench_rl_env_step.py
+sim/tests/bench_rl_env_step.py
 ```
 
 最小功能：
@@ -424,6 +559,15 @@ sim/optim/bench_rl_env_step.py
 | `--steps` | 每个环境 step 数 |
 | `--n-envs` | 环境数量 |
 | `--vec` | `none` / `dummy` / `subproc` |
+
+建议实现方式：
+
+1. `none`：直接创建单个 `RLTuningEnv`，循环 `env.step(env.action_space.sample())`。
+2. `dummy`：用 `stable_baselines3.common.vec_env.DummyVecEnv` 包装多个 env factory，验证向量接口与 reset/step 返回值。
+3. `subproc`：用 `SubprocVecEnv` 包装多个 env factory；Windows 下必须把脚本入口放在 `if __name__ == "__main__":` 下面，env factory 必须是可 pickle 的顶层函数或闭包中只捕获简单参数。
+4. 每个 env 使用不同 seed，例如 `seed + rank`。
+5. 记录 wall time、总 step 数、step/s、单步平均耗时，并把结果保存为 `results/rl_bench/bench_rl_env_step_<timestamp>.csv` 或直接打印成表。
+6. benchmark 不做 SAC 学习、不保存模型、不改训练逻辑。
 
 测试矩阵：
 
@@ -444,20 +588,31 @@ sim/optim/bench_rl_env_step.py
 | CPU/内存 | 无明显打满导致卡死 |
 | baseline loss 预计算 | 不应重复到不可接受 |
 
+判断规则：
+
+- 如果 `SubprocVecEnv(n=4)` 都无法稳定启动或退出，先不要做 E06。
+- 如果 `n_envs=4/8` 相对 single 没有明显加速，说明当前瓶颈可能不是可并行的 step，或者进程开销抵消收益，先不要改训练主流程。
+- 如果 `n_envs=8` 有至少 3x 加速，才值得接入 `rl_train.py` 并用于多 seed / holdout。
+
 ### 8.5 结果填写
 
-| 模式 | n_envs | steps/env | wall time(s) | step/s | 加速比 | CPU 占用 | 内存 | 是否通过 |
-|---|---:|---:|---:|---:|---:|---|---|---|
-| single | 1 | 20 |  |  | 1.0x |  |  |  |
-| dummy | 4 | 20 |  |  |  |  |  |  |
-| subproc | 4 | 20 |  |  |  |  |  |  |
-| subproc | 8 | 20 |  |  |  |  |  |  |
-| subproc | 12 | 20 |  |  |  |  |  |  |
+正式结果（truck_trailer，标准 48 条轨迹，10 steps/env，3 repeats，取中位数）：
+
+| 模式 | n_envs | worker torch threads | median wall time(s) | transitions/s | 加速比 | 并行效率 | 稳定性 |
+|---|---:|---:|---:|---:|---:|---:|---|
+| single | 1 | 默认 | 37.45 | 0.2670 | 1.00x | 100.0% | 3/3 正常 |
+| dummy | 4 | 默认 | 209.36 | 0.1911 | 0.68x | 17.1% | 3/3 正常，但串行更慢 |
+| subproc | 2 | 默认 | 58.35 | 0.3428 | 1.22x | 61.2% | 3/3 正常 |
+| subproc | 4 | 1 | 94.08 | 0.4252 | 1.59x | 39.8% | 3/3 正常 |
+| subproc | 8 | 1 | 154.05 | 0.5193 | 1.95x | 24.3% | 3/3 正常 |
+| subproc | 12 | 1 | 204.38 | 0.5871 | 2.20x | 18.3% | 2 次正常，1 次 1150.02s 长尾 |
+
+补充信息：24 个逻辑处理器；PyTorch 默认每进程为 16 个 intra-op / 24 个 inter-op 线程，因此正式复测将 Subproc worker 限制为 1 个线程。baseline loss 只在主进程预计算一次，耗时约 302.54s，再通过内存统计注入各 worker，避免按环境数重复计算。
 
 结论填写：
 
 ```text
-
+E05 已完成。Windows SubprocVecEnv 可以正常启动、运行和退出，baseline 统计内存注入也避免了各 worker 重复预计算；但当前 PC 上环境吞吐扩展性不足。稳定配置中 subproc8 仅达到 1.95x，中位吞吐为 0.5193 transitions/s，低于进入 E06 所要求的 3x；subproc12 虽达到 2.20x 中位加速，但并行效率仅 18.3%，并出现一次 1150.02s 严重长尾。因此 E05 未通过 E06 接入门槛，当前不应修改 rl_train.py 接入 --n-envs。若后续重启 E06，应先定位进程调度、Torch/BLAS 线程和仿真内部共享资源导致的扩展性瓶颈。
 ```
 
 ## 9. E06：接入 `--n-envs` 并行 SAC 训练
@@ -468,7 +623,7 @@ sim/optim/bench_rl_env_step.py
 
 ### 9.2 当前可行性
 
-需要改代码。风险点包括 Windows `spawn`、环境 pickle、baseline loss 重复预计算、EvalCallback 频率和日志路径。
+暂缓实施。E05 已证明 Windows `spawn` 和 baseline 统计内存注入可用，但 subproc8 稳定加速仅 1.95x，未达到 3x 接入门槛；subproc12 还有严重长尾。当前不修改 `rl_train.py`。若后续重新启动 E06，风险点仍包括环境进程扩展性、Torch/BLAS 线程、EvalCallback 频率、UTD 保持和日志路径。
 
 ### 9.3 建议实现范围
 
@@ -481,6 +636,18 @@ sim/optim/bench_rl_env_step.py
 | env factory | 每个 env 使用不同 seed |
 | baseline loss cache | 至少避免明显重复预计算，或先记录重复成本 |
 | EvalCallback | eval env 仍用单环境，降低复杂度 |
+
+建议源码改法：
+
+1. 在 `optim/rl_train.py` CLI 增加 `--n-envs`，默认 `1`；增加 `--vec-env choices=["dummy","subproc"]`，默认 `dummy` 或仅当 `--n-envs > 1` 时生效。
+2. 抽出 `make_env(rank)` 工厂，内部创建 `RLTuningEnv(plant=args.plant, config_path=args.config, ...)`，并在 reset 或 env 初始化后使用 `seed + rank`。
+3. `n_envs == 1` 时保持当前单环境路径，保证旧行为完全不变。
+4. `n_envs > 1` 时：
+   - `dummy` 使用 `DummyVecEnv([make_env(i) ...])`；
+   - `subproc` 使用 `SubprocVecEnv([make_env(i) ...], start_method="spawn")` 或按 SB3/Windows 推荐方式处理；
+   - 训练 env 使用 vec env，eval env 仍使用单个 `RLTuningEnv`。
+5. 保存路径需要包含 `n_envs` 和 `vec_env` 元信息，避免覆盖单环境结果。
+6. 先不要做 baseline loss cache 的复杂共享；如果 E05 显示预计算成本明显，可以后续单独加缓存。第一版只要求正确、可复现、旧路径不变。
 
 暂时不做：
 
@@ -788,7 +955,32 @@ python optim/rl_train.py `
 | OOD 回退到 DC | 可基于 `env.is_ood()` 扩展 |
 | 真实日志特征提取 | 未实现 |
 
-### 15.5 结果填写
+### 15.5 Rolling Preview 调度建议
+
+建议新增独立脚本，不直接塞进现有 `rl_evaluate.py`：
+
+```text
+sim/optim/rl_rolling_preview_evaluate.py
+```
+
+原因是 rolling preview 的时间粒度、状态缓存、参数平滑和安全回退都不同于当前 one-shot 评估。保持脚本独立可以不干扰 E01/E03/E04 的静态四臂结果。
+
+最小可行流程：
+
+1. 输入一条长轨迹或真实日志片段，按固定窗口切片，例如 preview horizon 5s，stride 0.5s 或 1.0s。
+2. 每个窗口提取与当前 RL observation 一致的几何/速度特征，并拼接当前 baseline 参数。
+3. SAC policy 输出 action，解码成候选控制器参数。
+4. 对候选参数做安全处理：
+   - clamp 到训练时允许的 action/参数边界；
+   - 对连续窗口参数做低通滤波或 EMA；
+   - 限制每个参数的最大变化率；
+   - 对 OOD 窗口 fallback 到 DC 参数；
+   - 可选地加入 loss/sanity guard，发现发散则回退。
+5. 用平滑后的参数序列跑仿真或回放评估，输出相对 Default/DC/one-shot RL 的 tracking loss、lat/head RMSE、最大误差和触发 fallback 次数。
+
+工作量判断：这不是只加一个脚本那么小。若只做仿真轨迹上的 prototype，大约是中等工作量；如果要接真实日志、实时特征、参数表导出和部署安全诊断，则是中到偏大的工程量。建议先做仿真版独立脚本，验证 rolling 是否能修复 `park_route` 或至少避免极端发散，再决定是否工程化。
+
+### 15.6 结果填写
 
 | 数据来源 | 轨迹/日志 | 方法 | avg loss/metrics | 是否 OOD | 是否触发回退 | 备注 |
 |---|---|---|---:|---|---|---|
@@ -807,16 +999,16 @@ python optim/rl_train.py `
 
 ### 第一轮：不改代码，先拿可复现证据
 
-1. E00：smoke test。
-2. E01：复现 DC vs DC+RL。
-3. E02：Default vs DC。
-4. E03：Pure RL-default 单 seed。
-5. E04：先手工汇总四臂核心指标。
+1. E03：Pure RL-default 单 seed，先明确“纯 RL”口径。
+2. E04：汇总 Default / DC / Pure RL / DC+RL 四臂核心指标。
+3. E00 仅在环境变化、依赖变化或迁移机器后重跑。
+
+已完成项：E01 DC vs DC+RL 已由 `20260609_175233/evaluation/result.txt` 支撑，E01P park_route 诊断已由 `20260609_175233/evaluation_with_park_route/rl_eval_results.yaml` 支撑，E02 Default vs DC 已由 `20260608_203406_mlp0525` 支撑，三者不需要重复跑。
 
 第一轮结束后应能回答：
 
 ```text
-Default、DC、Pure RL、DC+RL 谁最强？DC warm-start 是否必要？已有 DC+RL 结论是否可复现？
+Default、DC、Pure RL、DC+RL 谁最强？DC warm-start 是否必要？当前 truck_trailer 的 DC+RL 是否真的优于 DC？
 ```
 
 ### 第二轮：先解决训练成本
@@ -882,16 +1074,19 @@ Default、DC、Pure RL、DC+RL 谁最强？DC warm-start 是否必要？已有 D
 
 | 方法 | avg loss | 相比 Default | 相比 DC | 胜出轨迹数 | seed 数 |
 |---|---:|---:|---:|---:|---:|
-| Default |  |  |  |  |  |
-| DC |  |  |  |  |  |
-| Pure RL |  |  |  |  |  |
-| DC+RL |  |  |  |  |  |
+| Default | 32.1460 | - | +688.6% | - | 1 |
+| DC | 4.0761 | -87.3% | - | 待逐轨迹表固化 | 1 |
+| Pure RL | 12.9343 | -59.8% | +217.3% | 48/48 vs Default | 1 |
+| DC+RL | 2.9773 | -90.7% | -27.0% | 39/48 vs DC | 1 |
+
+注：Default 和 Pure RL 数值来自 `20260615_155054/evaluation/rl_eval_results.yaml`，按 `is_ood=false` 过滤标准 48 条后计算；DC 和 DC+RL 数值来自 `20260609_175233/evaluation/result.txt` 的标准 48 条评估统计。不要使用含 `park_route` 的 49 条均值作为四臂 avg loss。
 
 核心表 2：泛化
 
 | 训练/测试设置 | DC avg loss | DC+RL avg loss | 改善 | 胜出数 | 结论 |
 |---|---:|---:|---:|---:|---|
-| in-distribution |  |  |  |  |  |
+| in-distribution | 4.0761 | 2.9773 | -27.0% | 39/48 | 标准 48 条轨迹上 DC+RL 整体优于 DC，但仍有 9 条退化 |
+| park_route OOD | 28.8503 | 7715768.0000 | +26744067.8% | 0/1 | one-shot DC+RL policy 在强 OOD/复合路线下失效 |
 | trajectory holdout |  |  |  |  |  |
 | speed holdout |  |  |  |  |  |
 | plant holdout |  |  |  |  |  |
@@ -922,11 +1117,11 @@ Default、DC、Pure RL、DC+RL 谁最强？DC warm-start 是否必要？已有 D
 | “RL 方法具有泛化能力” | 缺 E09 holdout |
 | “Gradient-Informed SAC 优于普通 SAC” | 缺 E10 |
 | “该方法具备部署安全性” | 缺 E11/E12 |
-| “DC warm-start 是必要的” | 缺 E03/E04 C vs D |
+| “DC warm-start 是跨 seed 稳定必要的” | 缺 E08 多 seed 稳定性；单 seed E03/E04 已支持当前路线优于 Pure RL |
 | “并行仿真可显著加速训练” | 缺 E05/E06 benchmark |
 
 ## 18. 下一步执行建议
 
-建议下一次从 E00-E02 开始，先不改代码。若三项都通过，再做 E03 的 Pure RL-default 单 seed。完成后就能形成第一版四臂消融证据。
+E03/E04 单 seed 四臂主线已经基本完成，下一步建议先做 E05/E06 解决训练成本，再进入 E08 多 seed 稳定性。E05 只新增 `sim/tests/bench_rl_env_step.py`，测 `RLTuningEnv.step()` 在 single、DummyVecEnv、SubprocVecEnv 下的吞吐；如果 `n_envs=8` 至少有 3x 加速，再做 E06，把 `--n-envs` 和 `--vec-env` 最小接入 `rl_train.py`。如果 E05 加速不明显，不建议为了并行而改训练主流程，直接按单环境规划少量关键 seed。
 
-如果 E03 训练时间仍然不可接受，应暂停多 seed，先执行 E05/E06 的并行加速路线。
+E06 完成后优先跑 E08：DC+RL seed 42/43/44 与 Pure RL-default seed 42/43/44。目标是验证“DC+RL 优于 DC、Pure RL 弱于 DC+RL”不是 seed 42 偶然。`park_route` 不进入四臂 avg loss，应进入单独的部署安全路线：新增独立 `rl_rolling_preview_evaluate.py`，做 preview window 参数调度、参数平滑/限速和 OOD fallback 到 DC。rolling preview 是中等以上工作量，先做仿真 prototype，不要直接承诺部署安全 claim。

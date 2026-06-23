@@ -505,7 +505,7 @@ C:\Users\huangjiangyu\.conda\envs\pypose\python.exe optim/rl_evaluate.py `
     --rl-model "results/rl/truck_trailer/202606xx_xxxxxx/sac_model_final.zip" `
     --dc-config "results/training/truck_trailer/20260608_203406_mlp0525/tuned_4740dec_20260608_203243.yaml" `
     --plant truck_trailer `
-    --output-dir "results/rl/truck_trailer/202606xx_xxxxxx/evaluation"
+    --output "results/rl/truck_trailer/202606xx_xxxxxx/evaluation"
 
 # 8. 追加 park_route 综合园区路线评估（48 + 1）
 # park_route 是强 OOD / 综合路线，用于诊断泛化边界，不建议直接等同于标准训练集表现。
@@ -514,7 +514,7 @@ C:\Users\huangjiangyu\.conda\envs\pypose\python.exe optim/rl_evaluate.py `
     --dc-config "results/training/truck_trailer/20260608_203406_mlp0525/tuned_4740dec_20260608_203243.yaml" `
     --plant truck_trailer `
     --include-park-route `
-    --output-dir "results/rl/truck_trailer/202606xx_xxxxxx/evaluation_with_park_route"
+    --output "results/rl/truck_trailer/202606xx_xxxxxx/evaluation_with_park_route"
 
 # 9. 只训练/评估部分轨迹类型，用于 smoke test 或定位问题
 C:\Users\huangjiangyu\.conda\envs\pypose\python.exe optim/rl_train.py `
@@ -529,7 +529,7 @@ C:\Users\huangjiangyu\.conda\envs\pypose\python.exe optim/rl_evaluate.py `
     --dc-config "results/training/truck_trailer/20260608_203406_mlp0525/tuned_4740dec_20260608_203243.yaml" `
     --plant truck_trailer `
     --trajectories lane_change `
-    --output-dir "results/rl/truck_trailer/202606xx_xxxxxx/evaluation_lane_change"
+    --output "results/rl/truck_trailer/202606xx_xxxxxx/evaluation_lane_change"
 ```
 
 ---

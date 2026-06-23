@@ -1,6 +1,7 @@
 """RL 评估端到端测试：评估脚本完整性和 OOD 检测。"""
 import pytest
 import numpy as np
+import yaml
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -10,6 +11,39 @@ def test_plot_functions_importable():
     from optim.post_training import _plot_comparison_grid, _calc_metrics
     assert callable(_plot_comparison_grid)
     assert callable(_calc_metrics)
+
+
+def test_save_eval_results_writes_plain_yaml(tmp_path):
+    from optim.rl_evaluate import _save_eval_results
+
+    results = [{
+        'key': 'lane_change_5kph',
+        'rl_loss': np.float32(1.25),
+        'dc_loss': np.float64(2.5),
+        'delta_pct': np.float64(-50.0),
+        'is_ood': np.bool_(False),
+        'rl_action': np.array([0.1, -0.2], dtype=np.float32),
+    }]
+
+    output_path = _save_eval_results(
+        results,
+        output_dir=str(tmp_path),
+        rl_mean=np.float64(1.25),
+        dc_mean=np.float64(2.5),
+        win_count=1,
+        ood_count=0,
+    )
+
+    assert os.path.basename(output_path) == 'rl_eval_results.yaml'
+    with open(output_path, 'r', encoding='utf-8') as f:
+        saved = yaml.safe_load(f)
+
+    assert saved['summary']['trajectory_count'] == 1
+    assert saved['summary']['rl_avg_loss'] == pytest.approx(1.25)
+    assert saved['summary']['dc_avg_loss'] == pytest.approx(2.5)
+    assert saved['summary']['win_count'] == 1
+    assert saved['results'][0]['key'] == 'lane_change_5kph'
+    assert saved['results'][0]['rl_action'] == pytest.approx([0.1, -0.2])
 
 
 pytest.importorskip("stable_baselines3")

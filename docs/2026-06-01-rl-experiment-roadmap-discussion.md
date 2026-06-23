@@ -4,6 +4,8 @@
 
 本文记录一次关于 RL 参数自动整定后续路线的讨论结论。核心背景是：`sim/results/rl/hybrid_v2/20260526_195622/` 已经包含一次 **DC tuned baseline vs DC+RL** 的对比实验，因此后续工作不应重复证明同一件事，而应补齐消融矩阵、泛化验证和训练加速能力。
 
+2026-06-11 更新：当前论文/实验主线已切换到 `truck_trailer`。最新 RL 训练目录为 `sim/results/rl/truck_trailer/20260609_175233/`，其中 `sac_model_final.zip`、`best_model.zip` 和 `sac_model_17000_steps.zip` 的模型内部 `num_timesteps` 均为 `17000`，且 final replay buffer 已保存。该目录尚未生成正式 `evaluation/`，因此下一步应先对 `sac_model_final.zip` 执行 48 条标准轨迹评估，再单独执行 `--include-park-route` 的 OOD/综合路线诊断。当前不应直接进入算法改进或论文结论撰写。
+
 补充背景：另一个调研 session 的成果位于 `C:\Users\huangjiangyu\Desktop\硕士毕设材料\RL参数整定\调研\`。该调研给出的主线不是“普通 SAC 调参”，而是 **BPTT warm-start + Gradient-Informed SAC + 安全/泛化验证**。因此本文的实验路线需要同时满足两件事：
 
 1. 先用已有实现证明 BPTT+SAC 的场景自适应增量；
@@ -212,7 +214,82 @@
 
 ## 11. 建议下一步顺序
 
-推荐顺序如下：
+2026-06-11 更新后的判断：用户提出的“补算法对比、做 rolling agent 部署、做纯 RL/纯 DC/RL+DC 消融，然后进入论文写作”方向总体正确，但执行顺序需要约束。当前最重要的不是立即铺开 DDPG/TD3/PPO，而是先证明当前 SAC 版 DC+RL 在 truck_trailer 48 条标准轨迹上确实优于 DC，并把四臂消融钉住。
+
+### 11.1 近期 P0：先闭合主链路证据
+
+1. **E01：当前 SAC final 模型正式评估**  
+   对 `sim/results/rl/truck_trailer/20260609_175233/sac_model_final.zip` 执行 48 条标准轨迹评估，回答“DC+RL 是否优于 DC”。
+
+2. **E01P：park_route 单独诊断**  
+   `park_route` 不应混入 48 条标准轨迹结论。它是强 OOD/复合路线压力测试，用来判断 one-shot trajectory-level agent 的能力边界。
+
+3. **E03/E04：四臂消融**  
+   尽快补齐 Default / DC / Pure RL / DC+RL。当前 E02 Default vs DC 已由 `20260608_203406_mlp0525` 支撑，因此剩余关键是 Pure RL 和 DC+RL evaluation。
+
+这一轮结束后，才能严谨回答：
+
+```text
+DC 是否有效？RL 是否在 DC 之上有增量？DC warm-start 是否必要？当前主线是否值得继续做更复杂方法？
+```
+
+### 11.2 P1：泛化、稳定性和诊断能力
+
+如果 P0 成立，再补：
+
+1. **per-scenario 诊断输出**：`rl_evaluate.py` 保存 `rl_loss/dc_loss/delta/lat/head/is_ood/ood_distance/rl_action`。
+2. **多 seed 稳定性**：至少 3 个 seed，避免单次训练偶然性。
+3. **holdout 泛化**：轨迹类型 holdout、速度 holdout、随机曲率/随机换道长度、双 S 弯。
+4. **OOD 策略**：评估 `none/scale/fallback_dc` 等 OOD action 策略。
+
+没有这一层，论文只能声称“固定场景集合上有效”，不能声称“泛化”。
+
+### 11.3 P1/P2：Stable-Baselines3 算法对比
+
+算法对比应该作为支撑实验，而不是主线。推荐顺序：
+
+1. **SAC**：当前主方法，先稳定。
+2. **TD3**：最值得优先比较，连续动作、off-policy，与 SAC 接近。
+3. **DDPG**：可作为较弱/经典 baseline，但训练可能更不稳定。
+4. **PPO**：可做，但当前环境更接近 contextual bandit/one-step episodic，PPO 样本效率可能较差。
+
+算法对比回答的问题是：
+
+```text
+收益来自“BPTT warm-start + RL 场景自适应”框架，还是 SAC 特定算法偶然表现好？
+```
+
+它不应替代四臂消融。若四臂消融不成立，算法对比的论文价值会很弱。
+
+### 11.4 P2：rolling preview / 在线参数调度部署
+
+rolling 参数调度是部署方向，也是解释 `park_route` 的自然后续。建议先做 inference-only 原型，而不是立刻重训 rolling RL：
+
+1. 把 `park_route` 切成未来 5s 局部窗口。
+2. 对每个窗口提取局部特征。
+3. 用当前 SAC agent 输出 action timeline。
+4. 检查 action 是否贴边、是否跳变。
+5. 加参数变化率限制、平滑切换和 OOD gating。
+6. 做 rolling simulation，对比 `DC tuned / global RL / rolling RL`。
+
+若 rolling RL 明显改善 `park_route`，再考虑构建真正的多步 rolling RL environment。此时 observation 应包含当前状态、当前参数、未来预瞄窗口特征；reward 应包含局部跟踪误差、控制平顺性和参数变化惩罚。
+
+### 11.5 什么时候进入论文写作
+
+可以现在就开始准备论文材料，但完整论文结论应等以下证据齐备：
+
+| 证据 | 作用 |
+|---|---|
+| 四臂消融表 | 支撑主 claim：DC warm-start + RL 是否必要 |
+| 至少一组泛化/holdout 或 park_route+rolling 结果 | 支撑“场景自适应/复杂路线应用” |
+| 算法对比表 | 支撑 SAC 不是偶然选择 |
+| 失败/边界分析 | 支撑 limitation 和未来工作 |
+
+因此，`ml-paper-writing` 可以先用于整理方法、实验设计、图表模板和论文大纲；真正写摘要和实验结论时，应等待 E01/E03/E04/E09 或 rolling 关键结果完成。
+
+### 11.6 原始路线顺序
+
+原始推荐顺序如下，现保留为中长期路线：
 
 1. **先做并行仿真 benchmark**：只测 step 吞吐，不训练完整 SAC。
 2. **实现 `--n-envs` 并行训练**：先支持 SAC，别同时引入多算法。
