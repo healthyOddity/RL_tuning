@@ -58,14 +58,26 @@ def _lookup1d_batch(table_x: torch.Tensor, table_y: torch.Tensor,
     if x.dim() == 0:
         x = x.unsqueeze(0)
     if len(table_x) == 1:
-        return table_y[0].expand(x.shape[0]).clone()
+        if table_y.dim() == 1:
+            return table_y[0].expand(x.shape[0]).clone()
+        return table_y[:, 0].clone()
     x_clamped = torch.clamp(x, table_x[0].item(), table_x[-1].item())
     idx = torch.searchsorted(table_x, x_clamped) - 1
     idx = torch.clamp(idx, 0, len(table_x) - 2).long()
     x0 = table_x[idx]
     x1 = table_x[idx + 1]
-    y0 = table_y[idx]
-    y1 = table_y[idx + 1]
+    if table_y.dim() == 1:
+        y0 = table_y[idx]
+        y1 = table_y[idx + 1]
+    elif table_y.dim() == 2:
+        if table_y.shape[0] != x.shape[0]:
+            raise ValueError(
+                f"table_y batch {table_y.shape[0]} does not match x batch {x.shape[0]}")
+        batch_idx = torch.arange(x.shape[0], device=x.device)
+        y0 = table_y[batch_idx, idx]
+        y1 = table_y[batch_idx, idx + 1]
+    else:
+        raise ValueError(f"table_y must be [K] or [B,K], got {tuple(table_y.shape)}")
     t = (x_clamped - x0) / (x1 - x0 + 1e-12)
     t = torch.clamp(t, 0.0, 1.0)
     return y0 + (y1 - y0) * t
@@ -1071,6 +1083,48 @@ class BatchedLonCtrl(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────
 # 5. 主循环 / loss / 训练入口
 # ─────────────────────────────────────────────────────────────────────────
+
+RL_ACTION_BOUNDS = torch.tensor([
+    0.3, 0.3, 0.3, 0.3,
+    0.1, 0.02, 0.1, 0.02, 0.1, 0.02, 0.5,
+], dtype=torch.float32)
+
+
+def build_batched_rl_controllers(cfg: dict, actions) -> tuple[BatchedLatTruck, BatchedLonCtrl]:
+    """Build batched controllers with independent RL-tuned params per row."""
+    action_t = torch.as_tensor(actions, dtype=torch.float32)
+    if action_t.dim() != 2 or action_t.shape[1] != 11:
+        raise ValueError(f"actions must have shape [B, 11], got {tuple(action_t.shape)}")
+    action_t = torch.clamp(action_t, -RL_ACTION_BOUNDS, RL_ACTION_BOUNDS)
+    batch_size = int(action_t.shape[0])
+
+    lat_ctrl = BatchedLatTruck(cfg, batch_size=batch_size)
+    lon_ctrl = BatchedLonCtrl(cfg, batch_size=batch_size)
+
+    for col, name in enumerate(['T2_y', 'T3_y', 'T4_y', 'T6_y']):
+        base = getattr(lat_ctrl, name).detach()
+        tuned = base.unsqueeze(0) * (1.0 + action_t[:, col:col + 1])
+        setattr(lat_ctrl, name, nn.Parameter(tuned.clone()))
+
+    lon_specs = [
+        ('station_kp', 4, 0.0, None),
+        ('station_ki', 5, 0.0, None),
+        ('low_speed_kp', 6, 0.0, None),
+        ('low_speed_ki', 7, 0.0, None),
+        ('high_speed_kp', 8, 0.0, None),
+        ('high_speed_ki', 9, 0.0, None),
+        ('switch_speed', 10, 0.5, 10.0),
+    ]
+    for name, col, min_value, max_value in lon_specs:
+        base = getattr(lon_ctrl, name).detach()
+        tuned = base + action_t[:, col]
+        tuned = torch.clamp(tuned, min=float(min_value))
+        if max_value is not None:
+            tuned = torch.clamp(tuned, max=float(max_value))
+        setattr(lon_ctrl, name, nn.Parameter(tuned.clone()))
+
+    return lat_ctrl, lon_ctrl
+
 
 _SUPPORTED_BATCH_PLANTS = ('truck_trailer', 'hybrid_dynamic')
 

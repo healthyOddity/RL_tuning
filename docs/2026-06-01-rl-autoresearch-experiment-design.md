@@ -226,8 +226,8 @@ cd C:\Users\huangjiangyu\Desktop\hirain\L4\train_file\differentiable-control\sim
 | E02 | Default vs DC | 证明 BPTT/DC 相比原始参数有效 | 是 | P0 |
 | E03 | Pure RL around default/random | 证明无 DC warm-start 的 RL 能力 | 是 | P0 |
 | E04 | 四臂消融汇总 | Default/DC/PureRL/DC+RL 统一结论 | 部分，需要汇总脚本 | P0 |
-| E05 | 并行 RL 仿真 benchmark | 降低后续实验成本 | 否，需要补脚本 | P0 |
-| E06 | `--n-envs` 并行训练 | 加速 SAC 训练 | 否，需要改 `rl_train.py` | P0/P1 |
+| E05 | 并行/批量 RL 仿真 benchmark | 降低后续实验成本 | 已完成，未通过接入门槛 | Closed |
+| E06 | `--n-envs`/batched 并行训练 | 加速 SAC 训练 | Skip，当前不改 `rl_train.py` | Skip |
 | E07 | 单轨迹 BPTT vs 全局 BPTT | 验证“全局 BPTT 是多场景折中” | 部分，需要补单轨迹选择 | P1 |
 | E08 | 多 seed 稳定性 | 检查偶然性 | 是，但耗时高 | P1 |
 | E09 | holdout 泛化 | 验证场景自适应不是记忆训练集 | 部分，需要补 speed split | P1 |
@@ -615,6 +615,14 @@ sim/tests/bench_rl_env_step.py
 E05 已完成。Windows SubprocVecEnv 可以正常启动、运行和退出，baseline 统计内存注入也避免了各 worker 重复预计算；但当前 PC 上环境吞吐扩展性不足。稳定配置中 subproc8 仅达到 1.95x，中位吞吐为 0.5193 transitions/s，低于进入 E06 所要求的 3x；subproc12 虽达到 2.20x 中位加速，但并行效率仅 18.3%，并出现一次 1150.02s 严重长尾。因此 E05 未通过 E06 接入门槛，当前不应修改 rl_train.py 接入 --n-envs。若后续重启 E06，应先定位进程调度、Torch/BLAS 线程和仿真内部共享资源导致的扩展性瓶颈。
 ```
 
+### 8.6 E05B batched 仿真正式结果
+
+正式结果目录：`sim/results/rl_bench/e05b_batched_formal_20260623`。
+
+E05B 的单进程 batched evaluator 在 48 条标准轨迹上通过了部分吞吐测试，但未通过 fidelity gate。`random` action 下 batch 8 的中位吞吐达到 0.2784 transitions/s，相对 scalar random reference 约 4.82x；但同一配置的 `max_loss_rel_error` 为 13.39%，`mean_loss_rel_error` 为 1.43%。`zero` action 的最大误差更高，batch 4/16 为 31.60%，batch 8 为 29.63%。由于当前 RL tuning 在部分轨迹上的收益也可能只有约 5%，这种单轨迹 loss 误差足以改变 reward、改善/退化符号和后续策略学习方向。
+
+结论：E05B 不应接入普通 SAC 训练主线。当前可信基准仍是 scalar `RLTuningEnv`/`run_simulation` 路径；batched 路径只能保留为实验性吞吐工具或后续 per-trajectory 对齐调试对象。若未来重启 batched RL，必须先导出逐轨迹 scalar/batched loss、检查改善符号一致性，并把 `max_loss_rel_error` 降到足以区分 5% 级 RL 收益的范围内。
+
 ## 9. E06：接入 `--n-envs` 并行 SAC 训练
 
 ### 9.1 目的
@@ -623,7 +631,7 @@ E05 已完成。Windows SubprocVecEnv 可以正常启动、运行和退出，bas
 
 ### 9.2 当前可行性
 
-暂缓实施。E05 已证明 Windows `spawn` 和 baseline 统计内存注入可用，但 subproc8 稳定加速仅 1.95x，未达到 3x 接入门槛；subproc12 还有严重长尾。当前不修改 `rl_train.py`。若后续重新启动 E06，风险点仍包括环境进程扩展性、Torch/BLAS 线程、EvalCallback 频率、UTD 保持和日志路径。
+Skip。E05 的 `SubprocVecEnv` 路线没有达到 3x 稳定加速门槛；E05B 的 batched evaluator 虽有局部吞吐收益，但正式 48 轨迹 fidelity 未通过。当前不修改 `rl_train.py` 接入 `--n-envs` 或 batched SAC。后续多 seed、holdout 和算法对比应按 scalar 路径规划少量关键实验；只有在 batched 路径完成逐轨迹等价性修复后，才重新评估 E06。
 
 ### 9.3 建议实现范围
 
@@ -1011,16 +1019,16 @@ sim/optim/rl_rolling_preview_evaluate.py
 Default、DC、Pure RL、DC+RL 谁最强？DC warm-start 是否必要？当前 truck_trailer 的 DC+RL 是否真的优于 DC？
 ```
 
-### 第二轮：先解决训练成本
+### 第二轮：scalar 多 seed 稳定性
 
-1. E05：写 benchmark 脚本，只测 step 吞吐。
-2. 若 E05 证明 `SubprocVecEnv` 有效，再做 E06。
-3. 用并行能力重跑 E03/E08，降低多 seed 成本。
+1. E05/E05B：记录为加速路线未通过接入门槛。
+2. Skip E06：不把 `--n-envs` 或 batched reward 接入 `rl_train.py`。
+3. 用 scalar 路径规划少量关键 E08 多 seed 实验，优先保证结论可信。
 
 第二轮结束后应能回答：
 
 ```text
-当前 PC 是否支持 RL 并行加速？合理 n_envs 是多少？后续多 seed/holdout 是否可承受？
+在不接入并行/批量仿真的前提下，哪些 scalar 多 seed/holdout 实验最值得优先运行？
 ```
 
 ### 第三轮：补论文动机与泛化
@@ -1118,10 +1126,10 @@ Default、DC、Pure RL、DC+RL 谁最强？DC warm-start 是否必要？当前 t
 | “Gradient-Informed SAC 优于普通 SAC” | 缺 E10 |
 | “该方法具备部署安全性” | 缺 E11/E12 |
 | “DC warm-start 是跨 seed 稳定必要的” | 缺 E08 多 seed 稳定性；单 seed E03/E04 已支持当前路线优于 Pure RL |
-| “并行仿真可显著加速训练” | 缺 E05/E06 benchmark |
+| “并行仿真可显著加速训练” | 当前不支持：E05 未达 3x 稳定加速，E05B 未通过 fidelity gate |
 
 ## 18. 下一步执行建议
 
-E03/E04 单 seed 四臂主线已经基本完成，下一步建议先做 E05/E06 解决训练成本，再进入 E08 多 seed 稳定性。E05 只新增 `sim/tests/bench_rl_env_step.py`，测 `RLTuningEnv.step()` 在 single、DummyVecEnv、SubprocVecEnv 下的吞吐；如果 `n_envs=8` 至少有 3x 加速，再做 E06，把 `--n-envs` 和 `--vec-env` 最小接入 `rl_train.py`。如果 E05 加速不明显，不建议为了并行而改训练主流程，直接按单环境规划少量关键 seed。
+E03/E04 单 seed 四臂主线已经基本完成。E05/E05B 的结论是并行/批量仿真暂时不适合作为普通 RL tuning 的训练加速主线：SubprocVecEnv 未达到 3x 稳定加速门槛，batched evaluator 在正式 48 轨迹上存在足以影响 5% 级 RL 收益判断的单轨迹 loss 误差。因此当前不做 E06，不把 `--n-envs` 或 batched reward 接入 `rl_train.py`；后续应继续以 scalar `RLTuningEnv`/`run_simulation` 作为可信训练与评估路径。
 
-E06 完成后优先跑 E08：DC+RL seed 42/43/44 与 Pure RL-default seed 42/43/44。目标是验证“DC+RL 优于 DC、Pure RL 弱于 DC+RL”不是 seed 42 偶然。`park_route` 不进入四臂 avg loss，应进入单独的部署安全路线：新增独立 `rl_rolling_preview_evaluate.py`，做 preview window 参数调度、参数平滑/限速和 OOD fallback 到 DC。rolling preview 是中等以上工作量，先做仿真 prototype，不要直接承诺部署安全 claim。
+下一步优先跑少量 scalar E08：DC+RL seed 42/43/44 与 Pure RL-default seed 42/43/44。目标是验证“DC+RL 优于 DC、Pure RL 弱于 DC+RL”不是 seed 42 偶然。`park_route` 不进入四臂 avg loss，应进入单独的部署安全路线：新增独立 `rl_rolling_preview_evaluate.py`，做 preview window 参数调度、参数平滑/限速和 OOD fallback 到 DC。rolling preview 是中等以上工作量，先做仿真 prototype，不要直接承诺部署安全 claim。
