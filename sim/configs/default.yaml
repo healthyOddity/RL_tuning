@@ -96,6 +96,24 @@ truck_trailer_vehicle:
   # MLP 残差 checkpoint（相对 sim/ 目录）
   checkpoint_path: configs/checkpoints/best_truck_trailer_error_model_0525.pth
 
+# Single-unit truck DeepONet plant:
+# base truck dynamics + history/time-query force residual network.
+truck_deeponet_vehicle:
+  m_t: 9300.0
+  Iz_t: 48639.0
+  L_t: 4.475
+  a_t: 2.267
+  Cf: 264000.0
+  Cr: 335000.0
+  wheel_radius: 0.5
+  track_width: 1.878
+  steering_ratio: 24.0
+  rho: 1.225
+  CdA_t: 5.82
+  rolling_coeff: 0.013
+  min_speed_mps: 0.5
+  checkpoint_path: configs/checkpoints/best_truck_deeponet_0623.pth
+
 simulation:
   dt: 0.02
 

@@ -8,6 +8,7 @@ from model.hybrid_dynamic_vehicle import HybridDynamicVehicle
 from model.generic_hybrid_vehicle import GenericHybridVehicle
 from model.dynamic_vehicle_v2 import VehicleDynamicsV2
 from model.truck_trailer_vehicle import TruckTrailerVehicle
+from model.truck_deeponet_vehicle import TruckDeepONetVehicle
 
 # base 动力学模型注册表（hybrid_v2 模式下通过 vehicle.base_model 选择）
 _BASE_MODEL_REGISTRY = {
@@ -36,6 +37,9 @@ def resolve_vehicle_geometry(cfg):
     if model_type == 'truck_trailer':
         tt = cfg['truck_trailer_vehicle']
         return tt['L_t'], tt['steering_ratio']
+    if model_type == 'truck_deeponet':
+        td = cfg['truck_deeponet_vehicle']
+        return td['L_t'], td['steering_ratio']
     return veh['wheelbase'], veh['steer_ratio']
 
 
@@ -93,6 +97,15 @@ def create_vehicle(cfg, x=0.0, y=0.0, yaw=0.0, v=0.0,
             checkpoint_path=checkpoint or None,
             trailer_mass_kg=tt_params.get('default_trailer_mass_kg', None))
 
+    elif model_type == 'truck_deeponet':
+        td_params = cfg['truck_deeponet_vehicle']
+        checkpoint = _resolve_checkpoint_path(
+            td_params.get('checkpoint_path', ''))
+        return TruckDeepONetVehicle(
+            params=td_params, x=x, y=y, yaw=yaw, v=v,
+            dt=dt, differentiable=differentiable,
+            checkpoint_path=checkpoint or None)
+
     elif model_type == 'hybrid_v2':
         veh_cfg = cfg['vehicle']
         base_model_name = veh_cfg.get('base_model', 'dynamic_v2')
@@ -115,4 +128,4 @@ def create_vehicle(cfg, x=0.0, y=0.0, yaw=0.0, v=0.0,
         raise ValueError(
             f"未知 vehicle.model_type: '{model_type}'，"
             f"支持: 'kinematic', 'dynamic', 'hybrid_dynamic', 'hybrid_v2', "
-            f"'truck_trailer'")
+            f"'truck_trailer', 'truck_deeponet'")

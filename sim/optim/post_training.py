@@ -51,8 +51,10 @@ def _build_run_tags(hyperparams: dict) -> str:
         else:
             short = (base
                      .replace('best_truck_trailer_error_model_', '')
+                     .replace('best_truck_deeponet_', '')
                      .replace('best_error_model_', '')
                      .replace('best_truck_trailer_error_model', '')
+                     .replace('best_truck_deeponet', '')
                      .replace('best_error_model', '')
                      .strip('_'))
             parts.append(f'mlp{short}' if short else 'mlp')
@@ -963,7 +965,8 @@ if __name__ == '__main__':
                              '默认全量验证 (8×6+1=49)')
     parser.add_argument('--plant', default=None,
                         choices=['kinematic', 'dynamic', 'hybrid_dynamic',
-                                 'hybrid_v2', 'truck_trailer'],
+                                 'hybrid_v2', 'truck_trailer',
+                                 'truck_deeponet'],
                         help='被控对象类型，默认使用配置中的值')
     parser.add_argument('--output-dir', default=None,
                         help='输出目录，默认 results/validation/{plant}/{timestamp}/')

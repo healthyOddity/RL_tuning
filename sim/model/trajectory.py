@@ -1002,7 +1002,9 @@ def _build_trajectory(ttype: str, speed_kph: int) -> list[TrajectoryPoint]:
     spd = speed_kph / 3.6
     p = _SPEED_PARAMS[speed_kph]
 
-    if ttype == 'lane_change':
+    if ttype == 'circle':
+        return generate_circle(radius=p['r_combined'], speed=spd)
+    elif ttype == 'lane_change':
         return generate_lane_change(lane_width=3.5, change_length=p['lc_len'],
                                     speed=spd)
     elif ttype == 'double_lc':
@@ -1047,6 +1049,7 @@ TRAJECTORY_TYPES = [
 
 # 中文标签（用于图表显示）
 _TYPE_LABELS = {
+    'circle': 'Circle',
     'lane_change': '单换道',
     'double_lc': '双换道',
     'clothoid_left': '左转clothoid',

@@ -155,6 +155,22 @@ def _build_traj_list(type_names, verbose=True):
     return [(key, gen) for key, _label, gen in expanded]
 
 
+def _resolve_mlp_checkpoint_from_cfg(cfg):
+    model_type = cfg.get('vehicle', {}).get('model_type', 'kinematic')
+    if model_type == 'truck_trailer':
+        return (cfg.get('truck_trailer_vehicle') or {}).get(
+            'checkpoint_path', '')
+    if model_type == 'truck_deeponet':
+        return (cfg.get('truck_deeponet_vehicle') or {}).get(
+            'checkpoint_path', '')
+    if model_type == 'hybrid_dynamic':
+        return (cfg.get('hybrid_dynamic_vehicle') or {}).get(
+            'checkpoint_path', '')
+    if model_type == 'hybrid_v2':
+        return (cfg.get('vehicle') or {}).get('checkpoint_path', '')
+    return ''
+
+
 def train(trajectories=None, n_epochs=100, lr=5e-2, lr_tables=5e-2,
           sim_length=None, tbptt_k=150, grad_clip=10.0,
           param_snapshot_interval=10, verbose=True, plant=None,
@@ -187,6 +203,7 @@ def train(trajectories=None, n_epochs=100, lr=5e-2, lr_tables=5e-2,
     cfg = load_config(config_path)
     if plant:
         apply_plant_override(cfg, plant)
+    mlp_checkpoint = _resolve_mlp_checkpoint_from_cfg(cfg)
     params = DiffControllerParams(cfg=cfg)
 
     # 注册梯度钩子：在 backward 过程中立即清理 NaN/Inf 梯度
@@ -431,6 +448,7 @@ def train(trajectories=None, n_epochs=100, lr=5e-2, lr_tables=5e-2,
                          for name, p in params.named_parameters()},
         'saved_path': saved_path,
         'params': params,
+        'mlp_checkpoint': mlp_checkpoint,
     }
 
 
@@ -456,7 +474,8 @@ if __name__ == '__main__':
                         help='参数快照打印间隔（epoch 数）')
     parser.add_argument('--plant', type=str, default=None,
                         choices=['kinematic', 'dynamic', 'hybrid_dynamic',
-                                 'hybrid_v2', 'truck_trailer'],
+                                 'hybrid_v2', 'truck_trailer',
+                                 'truck_deeponet'],
                         help='被控对象类型（覆盖 YAML 配置）')
     parser.add_argument('--config', type=str, default=None,
                         help='初始参数配置路径，用于 warm-start（从上次调参结果继续）')
@@ -506,6 +525,7 @@ if __name__ == '__main__':
         'w_steer_rate': args.w_steer_rate,
         'w_acc_rate': args.w_acc_rate,
         'runtime': runtime_info(include_argv=True),
+        'mlp_checkpoint': result.get('mlp_checkpoint', ''),
     }
     run_post_training(result, hyperparams, plant=args.plant,
                       trajectory_types=args.trajectories,

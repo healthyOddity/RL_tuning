@@ -5,13 +5,20 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from model.truck_trailer_vehicle import TruckTrailerVehicle
-from model.vehicle_factory import create_vehicle
+from model.truck_deeponet_vehicle import TruckDeepONetVehicle
+from model.vehicle_factory import create_vehicle, resolve_vehicle_geometry
 from config import load_config
 
 
 def _tt_cfg():
     cfg = load_config()
     cfg['vehicle']['model_type'] = 'truck_trailer'
+    return cfg
+
+
+def _td_cfg():
+    cfg = load_config()
+    cfg['vehicle']['model_type'] = 'truck_deeponet'
     return cfg
 
 
@@ -39,3 +46,12 @@ class TestVehicleFactory:
         car = create_vehicle(_tt_cfg(), x=0, y=0, yaw=0, v=5.0, dt=0.02,
                              differentiable=True)
         assert car.differentiable is True
+
+    def test_creates_truck_deeponet(self):
+        car = create_vehicle(_td_cfg(), x=0, y=0, yaw=0, v=5.0, dt=0.02)
+        assert isinstance(car, TruckDeepONetVehicle)
+
+    def test_truck_deeponet_geometry(self):
+        wheelbase, steer_ratio = resolve_vehicle_geometry(_td_cfg())
+        assert wheelbase == 4.475
+        assert steer_ratio == 24.0
