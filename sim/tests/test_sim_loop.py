@@ -41,8 +41,28 @@ class TestSimLoop:
         history = run_simulation(traj, init_speed=SHORT_SPEED, cfg=cfg)
         rec = history[0]
         for key in ['t', 'x', 'y', 'yaw', 'v', 'steer', 'acc',
-                    'lateral_error', 'heading_error', 'ref_x', 'ref_y']:
+                    'lateral_error', 'heading_error', 'ref_x', 'ref_y',
+                    'ref_v', 'ref_a']:
             assert key in rec, f"Missing key: {key}"
+
+    def test_step_callback_runs_inside_simulation_loop(self):
+        cfg = _tt_cfg()
+        traj = generate_straight(length=SHORT_LEN, speed=SHORT_SPEED)
+        seen = []
+
+        def callback(step, t, lat_ctrl, lon_ctrl, cfg):
+            if step < 3:
+                seen.append((step, t, lat_ctrl is not None,
+                             lon_ctrl is not None, cfg is not None))
+
+        run_simulation(traj, init_speed=SHORT_SPEED, cfg=cfg,
+                       step_callback=callback)
+
+        assert seen == [
+            (0, pytest.approx(0.0), True, True, True),
+            (1, pytest.approx(cfg['simulation']['dt']), True, True, True),
+            (2, pytest.approx(2 * cfg['simulation']['dt']), True, True, True),
+        ]
 
 
 class TestSimLoopDifferentiable:

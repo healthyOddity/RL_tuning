@@ -32,6 +32,7 @@ def test_save_eval_results_writes_plain_yaml(tmp_path):
         dc_mean=np.float64(2.5),
         win_count=1,
         ood_count=0,
+        run_spec={'model_path': 'model.zip', 'plant': 'truck_trailer'},
     )
 
     assert os.path.basename(output_path) == 'rl_eval_results.yaml'
@@ -42,8 +43,48 @@ def test_save_eval_results_writes_plain_yaml(tmp_path):
     assert saved['summary']['rl_avg_loss'] == pytest.approx(1.25)
     assert saved['summary']['dc_avg_loss'] == pytest.approx(2.5)
     assert saved['summary']['win_count'] == 1
+    assert saved['summary']['mean_action_saturation_ratio'] == 0.0
+    assert saved['run_spec']['model_path'] == 'model.zip'
+    assert saved['run_spec']['plant'] == 'truck_trailer'
     assert saved['results'][0]['key'] == 'lane_change_5kph'
     assert saved['results'][0]['rl_action'] == pytest.approx([0.1, -0.2])
+
+
+def test_cli_rejects_multiple_external_sources(tmp_path):
+    import subprocess
+
+    manifest_path = tmp_path / 'manifest.yaml'
+    csv_path = tmp_path / 'record.csv'
+    manifest_path.write_text('specs: []\n', encoding='utf-8')
+    csv_path.write_text('timestamp,position_enu.x,position_enu.y,heading\n',
+                        encoding='utf-8')
+
+    script = os.path.join(os.path.dirname(__file__), '..', 'optim',
+                          'rl_evaluate.py')
+    proc = subprocess.run([
+        sys.executable,
+        script,
+        '--rl-model', 'missing.zip',
+        '--dc-config', 'configs/default.yaml',
+        '--trajectory-manifest', str(manifest_path),
+        '--real-csv', str(csv_path),
+    ], cwd=os.path.join(os.path.dirname(__file__), '..'),
+       text=True, capture_output=True)
+
+    assert proc.returncode != 0
+    assert 'choose at most one' in proc.stderr
+
+
+def test_disable_mlp_runtime_override_clears_truck_checkpoint():
+    from config import load_config
+    from optim.rl_evaluate import _apply_eval_runtime_overrides
+
+    cfg = load_config()
+    cfg['truck_trailer_vehicle']['checkpoint_path'] = 'some_model.pth'
+
+    _apply_eval_runtime_overrides(cfg, disable_mlp=True)
+
+    assert cfg['truck_trailer_vehicle']['checkpoint_path'] == ''
 
 
 pytest.importorskip("stable_baselines3")

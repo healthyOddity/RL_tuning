@@ -48,6 +48,20 @@ sim/results/rl/truck_trailer/20260609_175233/
 3. **E01P park_route 诊断已完成**：`evaluation_with_park_route/rl_eval_results.yaml` 显示 49 场景中 OOD 数量为 1，`park_route` 被标记为 OOD，且 DC+RL 在该场景上严重退化。
 4. 在 Pure RL 对照和四臂汇总完成前，不应直接进入 rolling 部署或论文最终结论。
 
+## 2026-06-30 更新：32000/37000/42000 checkpoint 正式评估
+
+为避免只依据 TensorBoard `eval/mean_reward` 选择模型，已对 32000、37000、42000 三个候选 SAC policy 执行同一套 `rl_evaluate.py` 正式评估，并按标准 48 条轨迹统计 `is_ood=false` 的结果。该口径下不混入 `park_route`。
+
+| 候选模型 | 模型路径 | 评估目录 | RL avg loss | DC avg loss | avg loss 改善 | RL 胜出轨迹数 |
+|---|---|---|---:|---:|---:|---:|
+| 32000 best | `sim/results/rl/truck_trailer/20260623_continue_DCRL_30000/best_model.zip` | `sim/results/rl/truck_trailer/20260623_continue_DCRL_30000/evaluation_32000` | 2.9303 | 4.0761 | -28.11% | 41/48 |
+| 37000 best | `sim/results/rl/truck_trailer/20260625_continue_DCRL_42000_from_32000/best_model.zip` | `sim/results/rl/truck_trailer/20260625_continue_DCRL_42000_from_32000/evaluation_37000` | 2.8626 | 4.0761 | -29.77% | 43/48 |
+| 42000 final | `sim/results/rl/truck_trailer/20260625_continue_DCRL_42000_from_32000/sac_model_final.zip` | `sim/results/rl/truck_trailer/20260625_continue_DCRL_42000_from_32000/evaluation_42000_final` | 2.8233 | 4.0761 | -30.73% | 45/48 |
+
+正式 48 条评估的结论是：`42000 final` 的 avg loss 最低、胜出轨迹数最多，因此当前应作为标准 48 条口径下的最佳 DC+RL policy。`20260625_continue_DCRL_42000_from_32000/best_model.zip` 的模型内部 `num_timesteps` 为 37000，它是 `EvalCallback` 按 5 个随机 eval episode 的 mean reward 保存的训练期候选最优；该信号可用于筛选 checkpoint，但不应替代固定 48 条轨迹评估。
+
+需要注意，`evaluation_42000_final` 若包含 `park_route`，顶层 49 场景 summary 会被 OOD loss 严重污染；论文和实验表格应使用 `is_ood=false` 的 48 条标准轨迹统计，同时把 `park_route` 单独列为 OOD 诊断。
+
 ### E01 当前执行入口：truck_trailer DC+RL 正式评估（48 条标准轨迹）
 
 目的：回答当前 17000-step SAC policy 是否在 truck_trailer 标准 48 条轨迹上优于 DC tuned baseline。该入口对应正文第 4 节 E01，不再把历史 `hybrid_v2/20260526_195622` 作为当前主线 E01。
@@ -693,35 +707,69 @@ python optim/rl_train.py `
 
 ### 10.2 当前可行性
 
-当前标准轨迹集只有 8 类 × 6 个速度段 = 48 条，足够做四臂消融和 adapter smoke test，但不足以支撑“supervised adapter 具备强泛化能力”的结论。`train_batch.py` 支持 truck_trailer 批量 BPTT，可作为 oracle 生成工具的一部分；但它训练的是控制器参数本身，不是 adapter 网络。监督式 adapter 需要新增数据集生成、训练和评估脚本。
+当前标准轨迹集只有 8 类 × 6 个速度段 = 48 条，足够做四臂消融和 adapter smoke test，但不足以支撑“supervised adapter 具备强泛化能力”的结论。2026-07-03 的 E07 诊断表明，`train_batch.py` / `run_simulation_batch()` 当前不是普通 scalar DC baseline 的一比一复刻，不能作为 oracle 标签生成工具。监督式 adapter 仍需要新增数据集生成、训练和评估脚本，但 oracle 标签必须来自 scalar per-trajectory DC tuning，或来自经过 scalar 复验选优的候选。
 
 当前 `expand_trajectories(type_names, speed_bands)` 的速度段固定为 `[5, 18, 25, 35, 45, 55]`，轨迹几何参数也由 `_SPEED_PARAMS` 固定。若要构造 adapter 数据集，需要新增参数化轨迹采样入口，而不是只复用这 48 条标准轨迹。
 
-### 10.3 建议补充脚本
+### 10.3 E07 batched DC-param oracle 失败记录（2026-07-03）
 
-新增第一步脚本：
+本轮曾实现 `sim/optim/generate_bptt_dc_param_oracle_dataset.py`，尝试用 batched 仿真加速生成每条轨迹独立的 35D DC 参数 oracle。该实现已移到 `sim/tests/diagnose_e07_batched_dc_param_oracle.py` 作为失败诊断脚本；E07 trajectory manifest、RandomForest adapter schema 与分析脚本保留复用，但 batched oracle 本身降级为失败实验记录，不再作为后续 adapter 标签来源。
+
+失败原因不是“action oracle 与 DC 参数不一致”，因为该版本已经改成 DC-param oracle；真正问题是 batched 仿真没有严格复刻 scalar DC baseline 的闭环流程。代码与小样本诊断发现：
+
+1. 历史 batched oracle 内部优化调用 `run_simulation_batch(... hard_mode=False)`，走 batched smooth 训练路径，而不是 scalar `run_simulation()` 的同一条执行路径；
+2. scalar 纵控给 `LonController` 传 `car.speed_kph`，batched 纵控传 `vehicle.speed_signed_kph`，会影响低速、倒车、PID 分支和限幅；
+3. scalar 横纵向控制器与 batched 控制器不是同一实现复用，而是两套 smooth/STE 近似实现，闭环状态会放大小差异；
+4. scalar 仿真按 `int(traj_duration / dt)` 推进，batched 按 `T_max` 推进并用 `valid_mask` 参与 loss，loss 采样边界也不完全一致。
+
+不优化、只用 baseline 参数时，batched 与 scalar 已经存在明显误差：
+
+| trajectory | scalar loss | batched soft | batched hard | 结论 |
+|---|---:|---:|---:|---|
+| `double_lc_30kph_extra` | 0.2100 | 0.1974 | 0.1979 | 小误差 |
+| `combined_decel_45kph` | 6.9291 | 7.9828 | 6.9784 | soft 路径偏差明显 |
+| `s_curve_55kph` | 6.4908 | 6.3895 | 6.3840 | 小误差 |
+| `lane_change_18kph` | 0.9453 | 0.3801 | 0.3804 | 严重偏差 |
+| `stop_go_25kph_d0.8_stop3` | 34.4503 | 37.1546 | 35.5220 | stop-go 有偏差 |
+
+进一步的 scalar 逐条 DC 对照说明：`double_lc_30kph_extra` 在 scalar DC 下也会因 `lr=0.05` 与 final-only 保存而过冲，但 `combined_decel_45kph`、`s_curve_55kph`、`lane_change_18kph` 的 scalar DC 结果明显优于 batched oracle。因此，E07 后续不再使用 batched 仿真作为 oracle 生成器。batched 相关脚本只保留为失败诊断和后续 fidelity 修复参考；正式 E07 adapter 数据集必须改为 scalar per-trajectory DC oracle。
+
+### 10.4 当前正式执行脚本
+
+第一步先生成 E07 参数化轨迹 manifest：
 
 ```text
-sim/optim/generate_bptt_oracle_dataset.py
+sim/optim/generate_e07_trajectory_manifest.py
 ```
 
 功能：
 
-1. 生成或读取一批轨迹；
-2. 每条轨迹单独运行 BPTT，至少从 global DC 初始化；
-3. 可选 multi-start：`default`、`global_dc`、`random_1/2/3`，取 final loss 最低者作为近似 oracle；
-4. 提取与 `RLTuningEnv.extract_geometric_features()` 对齐的几何/速度特征；
-5. 保存每条轨迹的 oracle 参数、相对 global DC 的 11D action、global DC loss、oracle loss、参数差异范数和优化状态；
-6. 输出 `bptt_oracle_dataset.csv` 或 `.npz`。
+1. 默认 `param228` 保留标准 48，并扩充速度、U 型弯、大曲率圆弧、直线加减速和停车起步；
+2. 输出 YAML manifest，作为 oracle 和后续 holdout 分析的统一轨迹入口；
+3. 不改变 `expand_trajectories()` 的标准 48 评估入口，避免污染既有 DC/RL baseline。
 
-新增第二步脚本：
+第二步生成正式 scalar DC-param oracle：
 
 ```text
-sim/optim/train_scene_adapter.py
-sim/optim/evaluate_scene_adapter.py
+sim/optim/generate_scalar_dc_param_oracle_dataset.py
 ```
 
-`train_scene_adapter.py` 训练 `features -> 11D action`，第一版不建议做大网络。候选方法按复杂度从低到高：
+功能：
+
+1. 读取 manifest 或默认标准 48；
+2. 每条轨迹单独从 global DC baseline 初始化；
+3. 复用 scalar `run_simulation()`、`tracking_loss()` 和 `DiffControllerParams`，优化 35D DC 参数；
+4. 保存 best-so-far 参数，而不是 final-only 参数；
+5. 默认 reject worse：若 best scalar loss 未优于 global DC，则回退 baseline 参数并标记状态；
+6. 输出 `oracle_dataset.csv`、`oracle_dataset.npz`、`summary.yaml` 和逐 epoch trace。
+
+第三步训练并闭环评估 supervised adapter：
+
+```text
+sim/optim/train_e07_random_forest_adapter.py
+```
+
+当前第一版 adapter 使用 RandomForest，训练 `features[45D] -> delta_params[35D]`。评估必须把预测参数放回 scalar `run_simulation()`，比较 `global DC / scalar oracle / adapter` 的 closed-loop tracking loss，而不是只看参数 MSE。后续候选方法按复杂度从低到高：
 
 | 方法 | 作用 | 建议 |
 |---|---|---|
@@ -737,7 +785,7 @@ sim/optim/evaluate_scene_adapter.py
 Default / global DC / BPTT oracle / supervised adapter / Pure RL / DC+RL
 ```
 
-### 10.4 数据集规模判断
+### 10.5 数据集规模判断
 
 | 数据规模 | 作用 | 结论口径 |
 |---:|---|---|
@@ -756,7 +804,7 @@ Default / global DC / BPTT oracle / supervised adapter / Pure RL / DC+RL
 
 若使用公开数据集，建议只把它们作为 refline/场景来源，不直接当成控制参数标签来源。公开自动驾驶数据集通常提供轨迹、地图或行为数据，但不会提供 truck_trailer 控制器的 BPTT 最优参数，因此仍需要本仿真器生成 oracle 标签。
 
-### 10.5 48 条标准轨迹上的近似替代实验
+### 10.6 48 条标准轨迹上的近似替代实验
 
 如果暂时不扩充数据集，可先做 8 个轨迹类型级别的 BPTT，作为“全局 DC 是折中”的辅助证据：
 
@@ -773,7 +821,7 @@ python optim/train.py --plant hybrid_v2 --trajectories lc_accel --epochs 100
 
 注意：`train.py` 当前训练结束后会自动调用 `post_training`，没有 `--no-post-training` 开关；如果只想保存单类型 BPTT 参数而不自动验证，需要先补一个 `--no-post-training` CLI 开关。
 
-### 10.6 结果填写
+### 10.7 结果填写
 
 | split | 样本数 | 方法 | avg loss | median loss | worst loss | vs global DC | win count |
 |---|---:|---|---:|---:|---:|---:|---:|
@@ -854,63 +902,129 @@ python optim/rl_train.py `
 
 ### 12.1 目的
 
-验证已训练 DC+RL policy 和 supervised adapter 在新增未训练轨迹上的部署表现。当前阶段不把“重训式 holdout”作为必做项，因为重训成本高，而且论文更需要回答的是：已得到的场景自适应参数调度器能否直接用于未见轨迹、实车 refline 或复合路线。
+验证已训练 DC+RL policy 和后续 supervised adapter 在未训练仿真 refline、实车 record-refline 和复合长路线上的部署表现。当前阶段不把“重训式 holdout”作为必做项，因为重训成本高，而且论文更需要回答的是：已得到的场景自适应参数调度器能否直接用于未见 refline，以及 one-shot policy 的失败边界能否通过 rolling preview + 安全约束缓解。
 
 ### 12.2 当前可行性
 
-当前可以做三层泛化评估：
+当前 E09 拆成四个子实验，避免把 one-shot policy 评估和 rolling 调度系统评估混在同一个结论里：
 
-| 层级 | 是否需要重训 | 当前价值 |
-|---|---|---|
-| 新增未训练仿真轨迹部署 | 否 | 最适合作为当前 E09 主线，直接测试已训练 policy/adapter |
-| 实车 refline 回放/仿真部署 | 否 | 更贴近硕士论文“工程泛化”与实车数据背景 |
-| 重训式 trajectory/speed holdout | 是 | 更严格，但耗时；可作为后续增强，不作为当前闭环必需 |
+| 子实验 | 评估方式 | 是否重训 | 实现入口 | 当前价值 |
+|---|---|---|---|---|
+| E09-A generated OOD one-shot | 整条 E07 manifest refline 只调用一次 agent | 否 | 扩展 `rl_evaluate.py` | 直接测试当前最佳 DC+RL policy 对未训练仿真轨迹的泛化 |
+| E09-B real record-refline one-shot | 整条实车 record-refline 只调用一次 agent | 否 | 扩展 `rl_evaluate.py` | 建立实车几何片段上的 one-shot baseline 和失败边界 |
+| E09-C generated OOD rolling | 固定 horizon/stride 周期调用 agent | 否 | 新增 `rl_rolling_preview_evaluate.py` | 验证局部预瞄调度能否改善复合/长 refline |
+| E09-D real record-refline rolling | 实车 record-refline 上 rolling 调度 | 否 | 新增 `rl_rolling_preview_evaluate.py` | 贴近部署形态，评估 smoothing、rate limit、OOD fallback 是否能避免极端发散 |
 
-需要补的不是重训代码，而是新增轨迹构造和评估入口。`rl_evaluate.py` 当前默认评估 env 的标准全量轨迹；若要评估指定新增轨迹，需要支持外部 trajectory list/refline 或新增参数化轨迹采样脚本。
+E09-A/B 与当前 `rl_evaluate.py` 的机制一致：`整条 refline -> extract_geometric_features -> SAC predict 一次 -> run_simulation 完整轨迹`。因此它们适合通过可选参数接入现有脚本。E09-C/D 的机制不同：它们需要按时间窗口反复提取局部特征、切换参数、平滑参数并记录 fallback，因此应独立成 rolling evaluation 脚本。
 
-### 12.3 新增未训练仿真轨迹部署
+### 12.3 E09-A：E07 generated OOD one-shot evaluation
 
-建议新增参数化轨迹生成脚本，生成标准 48 条之外的轨迹，例如：
+E07 已经生成 `results/e07_trajectories/e07_param228_manifest.yaml`，其中包含标准 48 条、额外速度段、U-turn、高曲率圆弧、直线加减速和 stop-and-go。E09-A 不重新造轨迹生成器，直接复用 `sim/optim/e07_trajectory_manifest.py` 的 manifest 与 materialize 逻辑，筛选未训练/OOD 轨迹做 one-shot 评估。
 
-| 类别 | 示例 |
-|---|---|
-| 插值速度 | 10/15/22/30/40/50/60 kph |
-| 插值几何 | 换道长度、clothoid 半径、S 弯半径在标准值之间采样 |
-| 边界几何 | 更短换道、更小半径、更长复合路线 |
-| 复合路线 | 换道 + 弯道 + 加减速组合 |
+建议 `rl_evaluate.py` 增加：
 
-评估方法：固定已训练模型，不重新训练。
-
-```powershell
-python optim/rl_policy_deploy_evaluate.py `
-  --plant truck_trailer `
-  --dc-config results/training/truck_trailer/20260608_203406_mlp0525/tuned_4740dec_20260608_203243.yaml `
-  --rl-model <best_dc_rl_model.zip> `
-  --trajectory-set generated_unseen `
-  --output results/rl_deploy/unseen_generated_<date>
+```text
+--trajectory-manifest results/e07_trajectories/e07_param228_manifest.yaml
+--trajectory-types-from-manifest uturn high_curvature_arc stop_and_go standard_speed_extra
+--max-trajectories N
 ```
 
-输出必须包含 `is_ood`、action 饱和比例、fallback 次数和 worst-case loss，不能只报均值。
+示例命令：
 
-### 12.4 实车 refline 部署泛化
+```powershell
+python optim/rl_evaluate.py `
+  --plant truck_trailer `
+  --dc-config results/training/truck_trailer/20260608_203406_mlp0525/tuned_4740dec_20260608_203243.yaml `
+  --rl-model results/rl/truck_trailer/20260625_continue_DCRL_42000_from_32000/sac_model_final.zip `
+  --trajectory-manifest results/e07_trajectories/e07_param228_manifest.yaml `
+  --trajectory-types-from-manifest uturn high_curvature_arc stop_and_go standard_speed_extra `
+  --output results/rl_deploy/e09a_generated_ood_oneshot_<date>
+```
 
-实车 refline 不需要提供“最优参数标签”，只需要能构造仿真参考线。最小字段建议为：
+输出继续使用 `rl_eval_results.yaml`，但必须增加数据来源、manifest key/type、`is_ood`、action 饱和比例、worst-case loss 等字段。E09-A 不启用 fallback，fallback 次数应为 0。
+
+### 12.4 E09-B：实车 record-refline one-shot evaluation
+
+E09-B 使用实车记录轨迹作为仿真 refline，而不是把每一时刻 CSV 中只保留的第一个 `ref_x/ref_y` 拼成 refline。原因是当前数据每一时刻的完整 refline 已丢失，只保留当前匹配/预瞄点，直接连线会混入在线规划或匹配点变化，几何解释不稳定。record-refline 口径与 grad tune evaluation 保持一致。
+
+实车 record-refline 的最小字段建议为：
 
 | 字段 | 用途 |
 |---|---|
-| `x, y` | 几何路径与最近点查询 |
-| `theta/yaw` | 航向误差计算 |
-| `t` | 时间查询与滚动窗口 |
-| `s` | 弧长、曲率估计、轨迹长度 |
-| `v` | 参考速度与 preview |
-| `a` | 参考加速度，纵向控制和特征 |
-| `kappa` | 曲率，横向控制 feedforward 和几何特征 |
+| `position_enu.x/y` | record-refline 几何路径 |
+| `euler_angles.z` 或 `heading` | record-refline 航向，需统一为 rad |
+| `timestamp` | 时间轴与窗口切片 |
+| 实车速度字段 | refline 速度，必要时平滑 |
+| `s` | 由 `x/y` 累积弧长重建 |
+| `kappa` | 由 `x/y/theta/s` 平滑后派生 |
+| `a` | 由速度对时间差分后平滑 |
 
-若原始 refline 只有点坐标和速度，需要由 `x/y/yaw/t` 派生 `s/kappa/a`，并记录滤波方法。实车 refline 评估建议直接进入 rolling preview：固定 horizon 5s、stride 0.5s 或 1s，周期调用 policy/adapter，并叠加参数平滑、限速和 OOD fallback。
+建议 `rl_evaluate.py` 增加：
 
-### 12.5 重训式 holdout 的位置
+```text
+--real-csv <interpolated.csv>
+--refline-source record
+--window-duration <seconds>
+```
 
-重训式 holdout 不是当前必做项，但如果后续要加强论文严谨性，可做两个最小版本：
+示例命令：
+
+```powershell
+python optim/rl_evaluate.py `
+  --plant truck_trailer `
+  --dc-config results/training/truck_trailer/20260608_203406_mlp0525/tuned_4740dec_20260608_203243.yaml `
+  --rl-model results/rl/truck_trailer/20260625_continue_DCRL_42000_from_32000/sac_model_final.zip `
+  --real-csv ..\..\data_process\data\data_0512\data_0512\0_interpolated\20260413_185635_interpolated.csv `
+  --refline-source record `
+  --window-duration 60.0 `
+  --output results/rl_deploy/e09b_real_record_oneshot_<date>
+```
+
+E09-B 的结论口径是“实车记录轨迹作为 replay/refline，测试 policy 在真实几何片段上的 one-shot 部署行为”，不是“跟踪原始在线规划 refline”。
+
+### 12.5 E09-C/D：rolling preview evaluation
+
+rolling preview 不应塞进 `rl_evaluate.py`。建议新增：
+
+```text
+sim/optim/rl_rolling_preview_evaluate.py
+```
+
+最小流程：
+
+1. 输入 E07 manifest 轨迹、`park_route` 或实车 record-refline。
+2. 按固定 `horizon_s` 与 `stride_s` 生成局部窗口，例如 horizon 5s、stride 1s。
+3. 每个窗口提取与当前 RL observation 一致的 10D 几何/速度特征，并拼接 baseline 参数。
+4. SAC policy 输出 action，解码成候选控制器参数。
+5. 对连续窗口参数做安全处理：
+   - clamp 到训练 action 边界；
+   - EMA 平滑；
+   - 参数变化率限制；
+   - OOD 窗口 fallback 到 DC baseline；
+   - 可选发散 guard，发现极端 loss/状态异常时回退。
+6. 用参数序列跑完整 refline 仿真，输出 tracking loss、lat/head/speed RMSE、max error、action 饱和比例、OOD 窗口数和 fallback 次数。
+
+示例命令：
+
+```powershell
+python optim/rl_rolling_preview_evaluate.py `
+  --plant truck_trailer `
+  --dc-config results/training/truck_trailer/20260608_203406_mlp0525/tuned_4740dec_20260608_203243.yaml `
+  --rl-model results/rl/truck_trailer/20260625_continue_DCRL_42000_from_32000/sac_model_final.zip `
+  --trajectory-manifest results/e07_trajectories/e07_param228_manifest.yaml `
+  --trajectory-types-from-manifest uturn high_curvature_arc stop_and_go `
+  --horizon-s 5.0 `
+  --stride-s 1.0 `
+  --ema-alpha 0.2 `
+  --ood-fallback dc `
+  --output results/rl_deploy/e09c_generated_ood_rolling_<date>
+```
+
+E09-C/D 的结论口径不同于 E09-A/B：它回答的是“局部预瞄调度 + 安全约束是否能把当前 one-shot policy 变成更接近部署形态的参数调度器”，不能直接归因于 SAC policy 本身。
+
+### 12.6 重训式 holdout 的位置
+
+重训式 holdout 不是当前必做项。如果后续要加强论文严谨性，可做两个最小版本：
 
 | 类型 | 训练集 | 测试集 | 是否重训 | 目的 |
 |---|---|---|---|---|
@@ -925,19 +1039,22 @@ python optim/rl_policy_deploy_evaluate.py `
 | `rl_train.py` | CLI 增加 `--speed-bands` |
 | `rl_evaluate.py` | CLI 增加 `--trajectories` 和 `--speed-bands` |
 
-### 12.6 结果填写
+### 12.7 结果填写
 
-| 测试集 | 方法 | avg loss | median loss | worst loss | win count vs DC | OOD 数 | fallback 次数 | 结论 |
+| 测试集 | 方法 | avg loss | median loss | worst loss | win count vs DC | OOD/窗口数 | fallback 次数 | 结论 |
 |---|---|---:|---:|---:|---:|---:|---:|---|
 | generated unseen | DC |  |  |  |  |  |  |  |
 | generated unseen | one-shot DC+RL |  |  |  |  |  |  |  |
+| generated unseen | rolling DC+RL + fallback |  |  |  |  |  |  |  |
 | generated unseen | supervised adapter |  |  |  |  |  |  |  |
 | real refline | DC |  |  |  |  |  |  |  |
-| real refline | rolling + fallback |  |  |  |  |  |  |  |
+| real refline | one-shot DC+RL |  |  |  |  |  |  |  |
+| real refline | rolling DC+RL + fallback |  |  |  |  |  |  |  |
 
 结论填写：
 
 ```text
+E09-A/B 回答当前 policy 是否可直接泛化到未见 refline；E09-C/D 回答 rolling preview + safety wrapper 是否能缓解 one-shot 在长路线、复合路线和真实几何片段上的失败边界。所有 E09 结论必须区分 one-shot policy 表现与 rolling 调度系统表现。
 
 ```
 
@@ -1105,10 +1222,10 @@ sim/optim/rl_rolling_preview_evaluate.py
 
 ### 第二轮：补 E07，建立非 RL 场景自适应 baseline
 
-1. 新增 `generate_bptt_oracle_dataset.py`，先在标准 48 条上打通 oracle 生成。
-2. 若 48 条链路正常，再扩展到 300 条左右参数化仿真轨迹，覆盖速度、曲率、曲率变化率和加减速组合。
-3. 新增 `train_scene_adapter.py` 与 `evaluate_scene_adapter.py`，训练并评估 kNN/Ridge/RandomForest/小 MLP 等非 RL adapter。
-4. 对比 `global DC / BPTT oracle / supervised adapter / DC+RL`，用闭环 tracking loss 而不是参数 MSE 下结论。
+1. 先用 `e07_trajectory_manifest.py` 生成并门控 E07 v2 参数化轨迹，剔除 base DC 本身不可控或几何不合理的 refline。
+2. 使用 `generate_scalar_dc_param_oracle_dataset.py` 逐条从当前 global DC baseline 初始化，保存 best-so-far 参数，并对未改善样本执行 reject-worse 回退。
+3. 使用 `train_scene_adapter.py` 与 `evaluate_scene_adapter.py` 训练并评估 kNN/Ridge/RandomForest/小 MLP 等非 RL adapter。
+4. 对比 `global DC / scalar DC oracle / supervised adapter / DC+RL`，用 scalar 闭环 tracking loss 而不是参数 MSE 下结论。
 
 第二轮结束后应能回答：
 
@@ -1216,12 +1333,12 @@ DC+RL 的优势是否跨 seed 稳定？连续 policy 是否需要被更安全的
 
 ## 18. 下一步执行建议
 
-当前不再把 E05/E06 并行加速作为后续主线。E05 multiprocess 和 E05B batched 仿真都没有同时满足速度与 fidelity 门槛，E06 跳过；后续 RL 训练保持 scalar 路线，接受多 seed 训练成本。
+当前不再把 E05/E06 并行加速作为后续主线。E05 multiprocess 和 E05B batched 仿真都没有同时满足速度与 fidelity 门槛，E06 跳过；E07 batched DC-param oracle 也因未能一比一复刻 scalar DC baseline 而降级为失败记录。后续 RL 训练与 E07 oracle 标签生成都保持 scalar 路线，接受训练成本，必要时用多进程并行调度多条独立 scalar 轨迹。
 
 下一步优先级调整为：
 
 1. **更新最佳 DC+RL 结果**：继续训练完成后，按标准 48 条轨迹 eval；若新模型在 avg loss、win count、worst-case 和 action 饱和检查上均优于或不劣于旧模型，则用新模型替换 `20260609_175233` 作为论文主结果。
-2. **补 E07 oracle/adaptor baseline**：48 条标准轨迹只够 smoke test；论文级 supervised scene adapter 建议扩展到约 300 条参数化仿真轨迹，生成 `BPTT oracle 参数` 标签后训练 kNN/Ridge/RandomForest/小 MLP 等非 RL adapter，并用闭环 loss 与 DC+RL 公平比较。
+2. **补 E07 oracle/adaptor baseline**：48 条标准轨迹只够 smoke test；论文级 supervised scene adapter 建议扩展到约 300 条参数化仿真轨迹，使用 scalar per-trajectory DC tuning 生成 `oracle DC 参数` 标签。每条轨迹从当前 global DC baseline 初始化，保存 best-so-far 参数而不是 final epoch；学习率先以 `0.01/0.005` 做小样本网格确认，再训练 kNN/Ridge/RandomForest/小 MLP 等非 RL adapter，并用闭环 loss 与 DC+RL 公平比较。
 3. **补 E09 部署泛化**：先不做重训式 holdout；直接把当前最佳 DC+RL policy 和 supervised adapter 部署到新增未训练仿真轨迹、`park_route`、实车 refline 片段，评估 one-shot 与 rolling preview + fallback 的控制效果和失败边界。
 4. **后置 E08 多 seed**：多 seed 仍然必要，但不需要改代码且耗时较高，可在主线结论更清晰后执行，用于确认 DC+RL 优势不是 seed 42 偶然。
 

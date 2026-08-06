@@ -76,7 +76,7 @@ class DiffControllerParams(nn.Module):
         return cfg
 
 
-def tracking_loss(history, ref_speed,
+def tracking_loss(history, ref_speed=None,
                   w_lat=10.0, w_head=8.0, w_speed=3.0,
                   w_steer_rate=0.05, w_acc_rate=0.01,
                   return_details=False):
@@ -84,7 +84,8 @@ def tracking_loss(history, ref_speed,
 
     Args:
         history: run_simulation 返回的 differentiable=True 历史记录
-        ref_speed: 参考速度 (m/s)
+        ref_speed: 参考速度 (m/s)。标量保持旧版常速口径；一维序列按时刻
+            对齐；为 None 时从每个 history row 的 ``ref_v`` 读取。
         w_lat/w_head/w_speed: 各误差项权重
         w_steer_rate/w_acc_rate: 平滑度惩罚权重
         return_details: 是否同时返回各分项指标（不含权重的原始值）
@@ -99,7 +100,25 @@ def tracking_loss(history, ref_speed,
     steers = torch.stack([h['steer'] for h in history])
     accs = torch.stack([h['acc'] for h in history])
 
-    speed_errs = speeds - ref_speed
+    if ref_speed is None:
+        if any('ref_v' not in h for h in history):
+            raise ValueError('ref_speed is None but history has no ref_v')
+        ref_speeds = torch.stack([
+            torch.as_tensor(h['ref_v'], dtype=speeds.dtype,
+                            device=speeds.device)
+            for h in history
+        ])
+    else:
+        ref_speeds = torch.as_tensor(
+            ref_speed, dtype=speeds.dtype, device=speeds.device)
+        if ref_speeds.ndim > 1:
+            raise ValueError('ref_speed must be a scalar or one-dimensional')
+        if ref_speeds.ndim == 1 and len(ref_speeds) != len(speeds):
+            raise ValueError(
+                f'ref_speed length {len(ref_speeds)} does not match '
+                f'history length {len(speeds)}')
+
+    speed_errs = speeds - ref_speeds
 
     lat_mse = (lat_errs ** 2).mean()
     head_mse = (head_errs ** 2).mean()

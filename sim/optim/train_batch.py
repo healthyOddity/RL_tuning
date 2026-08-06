@@ -47,6 +47,11 @@ from optim.train import DiffControllerParams  # 复用 to_config_dict
 DEG2RAD = math.pi / 180.0
 RAD2DEG = 180.0 / math.pi
 
+RL_ACTION_BOUNDS = torch.tensor([
+    0.3, 0.3, 0.3, 0.3,
+    0.1, 0.02, 0.1, 0.02, 0.1, 0.02, 0.5,
+], dtype=torch.float32)
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # 1. 批量基础算子
@@ -58,14 +63,27 @@ def _lookup1d_batch(table_x: torch.Tensor, table_y: torch.Tensor,
     if x.dim() == 0:
         x = x.unsqueeze(0)
     if len(table_x) == 1:
-        return table_y[0].expand(x.shape[0]).clone()
+        if table_y.dim() == 1:
+            return table_y[0].expand(x.shape[0]).clone()
+        return table_y[:, 0].clone()
     x_clamped = torch.clamp(x, table_x[0].item(), table_x[-1].item())
     idx = torch.searchsorted(table_x, x_clamped) - 1
     idx = torch.clamp(idx, 0, len(table_x) - 2).long()
     x0 = table_x[idx]
     x1 = table_x[idx + 1]
-    y0 = table_y[idx]
-    y1 = table_y[idx + 1]
+    if table_y.dim() == 1:
+        y0 = table_y[idx]
+        y1 = table_y[idx + 1]
+    elif table_y.dim() == 2:
+        if table_y.shape[0] != x.shape[0]:
+            raise ValueError(
+                f"per-batch table_y first dim {table_y.shape[0]} "
+                f"does not match x batch {x.shape[0]}")
+        row = torch.arange(x.shape[0], device=idx.device)
+        y0 = table_y[row, idx]
+        y1 = table_y[row, idx + 1]
+    else:
+        raise ValueError(f"table_y must be 1D or 2D, got {table_y.dim()}D")
     t = (x_clamped - x0) / (x1 - x0 + 1e-12)
     t = torch.clamp(t, 0.0, 1.0)
     return y0 + (y1 - y0) * t
@@ -1066,6 +1084,53 @@ class BatchedLonCtrl(nn.Module):
         T_raw = (F_resist + F_P) * self.torque_wheel_rolling_radius
         mask = (acc_cmd > self.torque_accel_deadzone).float().detach()
         return mask * T_raw
+
+
+def _clip_rl_actions(actions) -> torch.Tensor:
+    action_t = torch.as_tensor(actions, dtype=torch.float32)
+    if action_t.dim() != 2 or action_t.shape[1] != 11:
+        raise ValueError(
+            f"actions must have shape [B, 11], got {tuple(action_t.shape)}")
+    return torch.clamp(action_t, -RL_ACTION_BOUNDS, RL_ACTION_BOUNDS)
+
+
+def _replace_parameter_with_tensor(module: nn.Module, name: str,
+                                   value: torch.Tensor) -> None:
+    if name in module._parameters:
+        del module._parameters[name]
+    setattr(module, name, value)
+
+
+def build_batched_rl_controllers(cfg: dict, actions):
+    """Build batched controllers with one RL-style residual action per row."""
+    actions = _clip_rl_actions(actions)
+    batch_size = int(actions.shape[0])
+
+    lat_ctrl = BatchedLatTruck(cfg, batch_size=batch_size)
+    lon_ctrl = BatchedLonCtrl(cfg, batch_size=batch_size)
+
+    for col, name in enumerate(['T2_y', 'T3_y', 'T4_y', 'T6_y']):
+        base = getattr(lat_ctrl, name).detach().clone()
+        per_batch = base.unsqueeze(0) * (1.0 + actions[:, col:col + 1])
+        _replace_parameter_with_tensor(lat_ctrl, name, per_batch)
+
+    lon_specs = [
+        ('station_kp', 4, 0.0, None),
+        ('station_ki', 5, 0.0, None),
+        ('low_speed_kp', 6, 0.0, None),
+        ('low_speed_ki', 7, 0.0, None),
+        ('high_speed_kp', 8, 0.0, None),
+        ('high_speed_ki', 9, 0.0, None),
+        ('switch_speed', 10, 0.5, 10.0),
+    ]
+    for name, col, min_value, max_value in lon_specs:
+        base = getattr(lon_ctrl, name).detach().clone()
+        tuned = torch.clamp(base + actions[:, col], min=float(min_value))
+        if max_value is not None:
+            tuned = torch.clamp(tuned, max=float(max_value))
+        _replace_parameter_with_tensor(lon_ctrl, name, tuned)
+
+    return lat_ctrl, lon_ctrl
 
 
 # ─────────────────────────────────────────────────────────────────────────

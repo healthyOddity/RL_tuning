@@ -100,6 +100,35 @@ class TestTrackingLoss:
         loss.backward()
         assert lat_err.grad is not None
 
+    def test_time_varying_reference_speed_uses_history_ref_v(self):
+        ref_values = [2.0, 3.0, 4.0, 5.0]
+        history = [{
+            'lateral_error': torch.tensor(0.0),
+            'heading_error': torch.tensor(0.0),
+            'v': torch.tensor(ref_v),
+            'ref_v': ref_v,
+            'steer': torch.tensor(0.0),
+            'acc': torch.tensor(0.0),
+        } for ref_v in ref_values]
+
+        time_varying_loss = tracking_loss(history, ref_speed=None)
+        legacy_loss = tracking_loss(history, ref_speed=ref_values[0])
+
+        assert time_varying_loss.item() == pytest.approx(0.0, abs=1e-6)
+        assert legacy_loss.item() > 0.0
+
+    def test_reference_speed_sequence_length_must_match_history(self):
+        history = [{
+            'lateral_error': torch.tensor(0.0),
+            'heading_error': torch.tensor(0.0),
+            'v': torch.tensor(2.0),
+            'steer': torch.tensor(0.0),
+            'acc': torch.tensor(0.0),
+        } for _ in range(3)]
+
+        with pytest.raises(ValueError, match='does not match'):
+            tracking_loss(history, ref_speed=[2.0, 2.0])
+
 
 class TestTrain:
     def test_pipeline_runs_and_saves(self):

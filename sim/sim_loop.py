@@ -24,6 +24,7 @@ def run_simulation(trajectory: list[TrajectoryPoint],
                    lon_ctrl: LonController | None = None,
                    differentiable: bool = False,
                    tbptt_k: int = 0,
+                   step_callback=None,
                    ) -> list[dict]:
     """运行闭环仿真。返回历史记录。
 
@@ -81,6 +82,10 @@ def run_simulation(trajectory: list[TrajectoryPoint],
 
     for step in range(n_steps):
         t = step * dt
+        if step_callback is not None:
+            step_callback(step=step, t=t, lat_ctrl=lat_ctrl,
+                          lon_ctrl=lon_ctrl, cfg=cfg)
+        ref_time_pt = analyzer.query_nearest_by_relative_time(t)
 
         if differentiable:
             # Truncated BPTT: 每 K 步 detach 车辆状态，截断梯度链
@@ -137,6 +142,7 @@ def run_simulation(trajectory: list[TrajectoryPoint],
                     'lateral_error': lateral_error,
                     'heading_error': heading_error,
                     'ref_x': ref_pt.x, 'ref_y': ref_pt.y,
+                    'ref_v': ref_time_pt.v, 'ref_a': ref_time_pt.a,
                 })
                 v_prev = car.v.detach()
                 car.step(delta=delta_front, torque_wheel=torque_wheel)
@@ -150,6 +156,7 @@ def run_simulation(trajectory: list[TrajectoryPoint],
                     'lateral_error': lateral_error,
                     'heading_error': heading_error,
                     'ref_x': ref_pt.x, 'ref_y': ref_pt.y,
+                    'ref_v': ref_time_pt.v, 'ref_a': ref_time_pt.a,
                 })
                 car.step(delta=delta_front, acc=acc_cmd)
             prev_steer = steer_out
@@ -209,6 +216,7 @@ def run_simulation(trajectory: list[TrajectoryPoint],
                     'lateral_error': lateral_error,
                     'heading_error': heading_error,
                     'ref_x': ref_pt.x, 'ref_y': ref_pt.y,
+                    'ref_v': ref_time_pt.v, 'ref_a': ref_time_pt.a,
                 })
                 v_prev = car_v
                 car.step(delta=delta_front, torque_wheel=torque_wheel)
@@ -220,6 +228,7 @@ def run_simulation(trajectory: list[TrajectoryPoint],
                     'lateral_error': lateral_error,
                     'heading_error': heading_error,
                     'ref_x': ref_pt.x, 'ref_y': ref_pt.y,
+                    'ref_v': ref_time_pt.v, 'ref_a': ref_time_pt.a,
                 })
                 car.step(delta=delta_front, acc=acc_cmd)
             prev_steer = steer_out
